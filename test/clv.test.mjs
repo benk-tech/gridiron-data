@@ -77,7 +77,7 @@ test('normalizePending: plain tickers and { ticker, kickoff } objects, deduped, 
 
 // A Kalshi stand-in: /markets?tickers=... answers with `settled` (ticker -> result or null for still open),
 // /markets/trades serves the fixtures (or `tradesStatus[ticker]`), and every request is recorded.
-function fakeKalshi({ settled = {}, tradesStatus = {} } = {}) {
+function fakeKalshi({ settled = {}, tradesStatus = {}, tradesFor = {} } = {}) {
   const calls = [];
   const f = async (url) => {
     const u = new URL(url);
@@ -87,7 +87,7 @@ function fakeKalshi({ settled = {}, tradesStatus = {} } = {}) {
       const st = tradesStatus[t];
       if (st === 'budget') throw Object.assign(new BudgetError('settle time budget (30 s) spent'), {});
       if (st) return new Response('{"error":"x"}', { status: st });
-      const trades = t === ATL4 ? T_ATL4.trades : t === SFSEA ? T_SFSEA.trades : [];
+      const trades = tradesFor[t] || (t === ATL4 ? T_ATL4.trades : t === SFSEA ? T_SFSEA.trades : []);
       return new Response(JSON.stringify({ cursor: '', trades }), { status: 200 });
     }
     if (u.pathname.endsWith('/markets')) {
@@ -200,7 +200,7 @@ test('settleHandshake: at most maxCloses lookups per run; a settled result whose
   }
 });
 
-test('settleHandshake: a failing trades lookup delays a settlement at most a few runs, a refused one not at all', async () => {
+test('settleHandshake: a failing trades lookup (any error, 404 included) delays a settlement at most CLOSE.maxAttempts runs', async () => {
   const site = await fakeSite();
   const stateDir = mkdtempSync(join(tmpdir(), 'gd-clv-'));
   try {
@@ -209,16 +209,38 @@ test('settleHandshake: a failing trades lookup delays a settlement at most a few
     const k = () => fakeKalshi({ settled: { [ATL4]: 'no', [t404]: 'no' }, tradesStatus: { [ATL4]: 503, [t404]: 404 } });
     const now = Date.parse('2026-10-12T03:00:00Z');
     const a = await settleHandshake({ url: site.url, key: KEY, kalshi: clientOf(k()), now, stateDir });
-    // 404: Kalshi refused the lookup, so it will never work: posted now without a close. 503: held for a retry.
-    assert.deepEqual(site.state.settled[0].results.map((r) => [r.ticker, r.closeYes]), [[t404, null]]);
-    assert.equal(a.closes.held, 1);
-    assert.equal(a.closes.failed, 2);
-    site.state.pending = [{ ticker: ATL4, kickoff: KO_ATL4 }];
+    assert.equal(site.state.settled.length, 0, 'both held for a retry');
+    assert.deepEqual([a.closes.held, a.closes.failed], [2, 2]);
     const b = await settleHandshake({ url: site.url, key: KEY, kalshi: clientOf(k()), now: now + 300e3, stateDir });
-    assert.equal(b.closes.held, 1, 'second failure: still held');
+    assert.equal(b.closes.held, 2, 'second failure: still held');
     const c = await settleHandshake({ url: site.url, key: KEY, kalshi: clientOf(k()), now: now + 600e3, stateDir });
     assert.equal(c.closes.held, 0, `third failure (CLOSE.maxAttempts = ${CLOSE.maxAttempts}): posted without a close`);
-    assert.deepEqual(site.state.settled[1].results.map((r) => [r.ticker, r.result, r.closeYes]), [[ATL4, 'no', null]]);
+    assert.deepEqual(site.state.settled[0].results.map((r) => [r.ticker, r.result, r.closeYes]).sort(), [[t404, 'no', null], [ATL4, 'no', null]].sort());
+  } finally {
+    site.server.close();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('settleHandshake: a backlog after a collector outage (kickoffs days old, more than one run of lookups) still gets every close', async () => {
+  const site = await fakeSite();
+  const stateDir = mkdtempSync(join(tmpdir(), 'gd-clv-'));
+  try {
+    const third = 'KXNFLSPREAD-26OCT11BALATL-ATL7';
+    site.state.pending = [{ ticker: ATL4, kickoff: KO_ATL4 }, { ticker: SFSEA, kickoff: KO_SFSEA }, { ticker: third, kickoff: KO_ATL4 }];
+    const settled = { [ATL4]: 'no', [SFSEA]: 'yes', [third]: 'no' };
+    const now = Date.parse(KO_ATL4) + 3 * 86400e3; // three days after kickoff, far past CLOSE.holdMs
+    const held = [];
+    for (let i = 0; i < 3; i++) {
+      const out = await settleHandshake({ url: site.url, key: KEY, kalshi: clientOf(fakeKalshi({ settled, tradesFor: { [third]: T_ATL4.trades } })), now: now + i * 300e3, stateDir, maxCloses: 1 });
+      held.push(out.closes.held);
+      const done = new Set((site.state.settled.at(-1)?.results || []).map((r) => r.ticker));
+      site.state.pending = site.state.pending.filter((p) => !done.has(p.ticker));
+    }
+    assert.deepEqual(held, [2, 1, 0]);
+    const posted = site.state.settled.flatMap((x) => x.results);
+    assert.equal(posted.length, 3);
+    assert.ok(posted.every((r) => typeof r.closeYes === 'number'), JSON.stringify(posted));
   } finally {
     site.server.close();
     rmSync(stateDir, { recursive: true, force: true });
