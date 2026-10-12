@@ -18,7 +18,7 @@ const NV = {
   'roster_weekly_2026.csv.gz': 'roster_weekly_2026_trim.csv.gz',
   'advstats_week_def_2026.csv.gz': 'advstats_week_def_2026.csv.gz',
 };
-const OFF = { parts: { props: false, teamTotals: false, injuries: false, nflverse: false, cfb: false } };
+const OFF = { pauseMs: 0, parts: { props: false, teamTotals: false, injuries: false, nflverse: false, cfb: false } };
 
 // Serves the research capture (Kalshi core, ESPN boards) and the Phase B fixtures as if they were the live APIs.
 // Any URL it does not know is a test failure (calls.unknown), so nothing can reach the network.
@@ -187,9 +187,31 @@ test('pacedFetch: Kalshi requests start minGapMs apart, a 429 is retried after R
   assert.ok(k[k.length - 1] - k[0] >= 3 * 60 - 20, 'four Kalshi starts span at least three gaps');
   assert.ok(seen.find(([u]) => u.includes('espn'))[1] - t0 < 30, 'ESPN is not held behind Kalshi');
   // a persistent 429 is returned after retry429 extra attempts
-  const always = pacedFetch(async () => new Response('', { status: 429 }), { minGapMs: 0, backoffMs: 0, retry429: 2 });
+  const always = pacedFetch(async () => new Response('', { status: 429 }), { minGapMs: 0, backoffMs: 0, retry429: 2, maxRetries429: 3 });
   assert.equal((await always('https://api.elections.kalshi.com/x')).status, 429);
   assert.equal(always.stats.paced, 3);
+  // the run's retry budget (3) is nearly spent: one more retry, then every 429 comes back at once (fail fast)
+  assert.equal((await always('https://api.elections.kalshi.com/y')).status, 429);
+  assert.deepEqual(always.stats, { paced: 5, retried429: 3 });
+  assert.equal((await always('https://api.elections.kalshi.com/z')).status, 429);
+  assert.deepEqual(always.stats, { paced: 6, retried429: 3 });
+});
+
+test('collectInputs: Kalshi answering 429 everywhere fails fast and ESPN data still comes through', async () => {
+  const f = fakeApis();
+  const down = async (url, init) => (url.includes('kalshi.com') ? new Response('{"error":"too many requests"}', { status: 429 }) : f(url, init));
+  const t = Date.now();
+  // With the live gap (250 ms, 1.5 s x attempt backoff) the 4-retry cap bounds the extra wait to about 9 s per run;
+  // here the gap is 0 so the test is instant and checks the cap itself.
+  const inputs = await collectInputs({ now: Date.parse(RESEARCH_NOW), fetchImpl: down, pauseMs: 0, parts: { injuries: false, nflverse: false, cfb: false } });
+  const ms = Date.now() - t;
+  assert.equal(inputs.stats.kalshiRetried429, 4, 'the per-run retry budget');
+  assert.ok(ms < 5e3, `took ${ms} ms`);
+  assert.deepEqual(inputs.kalshi.markets, {});
+  const s = buildSnapshot(inputs, { now: Date.parse(RESEARCH_NOW) });
+  assert.equal(s.games.length, 76, 'ESPN games still listed');
+  assert.equal(s.sources.kalshi.ok, false);
+  assert.deepEqual(validateSnapshot(s), []);
 });
 
 test('collectInputs: a Kalshi 429 on a prop series is retried, counted, and the series kept', async () => {
