@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { researchInputs, balatlInputs, RESEARCH_NOW, BALATL_NOW } from './helpers.mjs';
-import { buildSnapshot, summarize, WINDOW } from '../lib/build.mjs';
+import { buildSnapshot, buildRun, summarize, WINDOW, PLAUSIBILITY } from '../lib/build.mjs';
 import { validateSnapshot } from '../lib/schema.mjs';
 import { teamScore } from '../lib/match.mjs';
 import { packSnapshot } from '../lib/ingest.mjs';
@@ -215,4 +215,120 @@ test('a builder that throws costs only its own source (build failed, ok=false); 
   assert.equal(s.sources.espnOdds.ok, true);
   assert.equal(s.games.length, 76);
   assert.deepEqual(s.games.map((g) => g.kalshi.markets), base.games.map((g) => g.kalshi.markets), 'core markets untouched');
+});
+
+// ---------------------------------------------------------------- plausibility: a fetch that worked but carries nothing usable
+
+const allBoards = (inp) => [...inp.espn.scoreboards.nfl, ...inp.espn.scoreboards.cfb];
+
+test('plausibility: ESPN boards that parse to nothing, or list no games in season, are flagged (espnOdds ok=false)', () => {
+  const renamed = researchInputs();
+  for (const b of allBoards(renamed)) for (const e of b.events) { e.contests = e.competitions; delete e.competitions; }
+  const a = buildSnapshot(renamed, { now: RESEARCH_NOW });
+  assert.equal(a.sources.espnOdds.ok, false);
+  assert.ok(a.sources.espnOdds.errors.includes('nfl: 14 scoreboard events but none could be read (ESPN format change?)'), a.sources.espnOdds.errors.join(' | '));
+  assert.ok(a.sources.espnOdds.errors.includes('cfb: 62 scoreboard events but none could be read (ESPN format change?)'));
+  assert.equal(a.sources.kalshi.ok, true, 'Kalshi itself is fine');
+
+  const empty = researchInputs();
+  for (const b of allBoards(empty)) b.events = [];
+  const b = buildSnapshot(empty, { now: RESEARCH_NOW });
+  assert.equal(b.games.length, 0);
+  assert.equal(b.sources.espnOdds.ok, false);
+  assert.deepEqual(b.sources.espnOdds.errors, ['nfl: the current regular season week lists no games (ESPN outage?)', 'cfb: the current regular season week lists no games (ESPN outage?)']);
+
+  const noList = researchInputs();
+  delete noList.espn.scoreboards.nfl[0].events;
+  assert.ok(buildSnapshot(noList, { now: RESEARCH_NOW }).sources.espnOdds.errors.includes('nfl: the scoreboard has no events list (ESPN format change?)'));
+
+  // a couple of unreadable events among many: not flagged (one odd event is not a format change)
+  const few = researchInputs();
+  for (const e of few.espn.scoreboards.cfb[0].events.slice(0, 2)) delete e.competitions;
+  const c = buildSnapshot(few, { now: RESEARCH_NOW });
+  assert.equal(c.sources.espnOdds.ok, true, c.sources.espnOdds.errors.join(' | '));
+  assert.equal(c.games.length, 74);
+
+  // off-season (season type 4) with no events: nothing to flag
+  const off = researchInputs();
+  for (const b2 of allBoards(off)) { b2.events = []; b2.season = { type: 4, year: 2027 }; b2.leagues[0].season.type = { type: 4 }; }
+  assert.equal(buildSnapshot(off, { now: RESEARCH_NOW }).sources.espnOdds.ok, true);
+});
+
+test('plausibility: Kalshi markets with no price at all, or no Kalshi game matching any ESPN game, are flagged (kalshi ok=false)', () => {
+  const cents = researchInputs();
+  for (const arr of Object.values(cents.kalshi.markets)) {
+    for (const m of arr) for (const k of Object.keys(m)) if (k.endsWith('_dollars')) { m[k.replace('_dollars', '')] = Math.round(Number(m[k]) * 100); delete m[k]; }
+  }
+  const a = buildSnapshot(cents, { now: RESEARCH_NOW });
+  assert.equal(a.sources.kalshi.ok, false);
+  assert.ok(a.sources.kalshi.errors.includes('2725 markets on matched games but none has a price (Kalshi format change?)'), a.sources.kalshi.errors.join(' | '));
+  assert.equal(a.sources.espnOdds.ok, true);
+
+  // Kalshi game dates two days off on every NFL event: nothing matches although both sides list the week
+  const shifted = researchInputs();
+  const bump = (t) => String(t).replace(/-26OCT(\d\d)/, (_, d) => `-26OCT${String(Number(d) + 2).padStart(2, '0')}`);
+  for (const s of ['KXNFLGAME', 'KXNFLSPREAD', 'KXNFLTOTAL']) for (const m of shifted.kalshi.markets[s]) { m.ticker = bump(m.ticker); m.event_ticker = bump(m.event_ticker); }
+  const b = buildSnapshot(shifted, { now: RESEARCH_NOW });
+  assert.equal(b.sources.kalshi.ok, false);
+  assert.ok(b.sources.kalshi.errors.some((e) => /^nfl: none of \d+ Kalshi games matched any of 14 ESPN games/.test(e)), b.sources.kalshi.errors.join(' | '));
+  assert.ok(!b.sources.kalshi.errors.some((e) => /^cfb: none/.test(e)), 'CFB still matches');
+
+  const base = buildSnapshot(researchInputs(), { now: RESEARCH_NOW });
+  assert.equal(base.sources.kalshi.ok, true);
+  assert.equal(base.sources.espnOdds.ok, true);
+});
+
+test('plausibility: the league injuries feed listing nobody while NFL games are in the window is flagged', () => {
+  const inp = researchInputs();
+  inp.injuryFeed = { league: { fetchedAt: RESEARCH_NOW, timestamp: RESEARCH_NOW, count: 0, items: [] }, depth: {}, schedule: [], leagueFetchedAt: RESEARCH_NOW, errors: [], requests: 1 };
+  const s = buildSnapshot(inp, { now: RESEARCH_NOW });
+  assert.equal(s.sources.injuries.ok, false);
+  assert.ok(s.sources.injuries.errors.includes('league injuries feed lists no players while 14 NFL games are in the window (ESPN format change?)'), s.sources.injuries.errors.join(' | '));
+  // no NFL games in the window (CFB only): an empty feed is not suspicious
+  const cfbOnly = researchInputs();
+  cfbOnly.injuryFeed = inp.injuryFeed;
+  cfbOnly.espn.scoreboards.nfl = [];
+  assert.ok(!buildSnapshot(cfbOnly, { now: RESEARCH_NOW }).sources.injuries.errors.some((e) => /lists no players/.test(e)));
+});
+
+test('cross-run: games the previous run listed as upcoming that vanish are flagged; an empty run after a full one is held', () => {
+  const t0 = Date.parse(RESEARCH_NOW);
+  const first = buildRun(researchInputs(), { now: t0 });
+  assert.equal(first.hold, null);
+  const prev = JSON.parse(JSON.stringify(first.history));
+  const later = (min) => t0 + min * 60e3;
+
+  // same boards 5 minutes later: nothing flagged
+  const same = buildRun({ ...researchInputs(), history: prev }, { now: later(5) });
+  assert.equal(same.snapshot.sources.espnOdds.ok, true, same.snapshot.sources.espnOdds.errors.join(' | '));
+  assert.equal(same.hold, null);
+
+  // the CFB board lost its events (and has no season type to go on): CFB flagged from the history alone, NFL fine, not held
+  const cfbGone = researchInputs();
+  cfbGone.espn.scoreboards.cfb = [{ events: [] }];
+  const r1 = buildRun({ ...cfbGone, history: prev }, { now: later(5) });
+  assert.equal(r1.snapshot.games.length, 14);
+  assert.equal(r1.snapshot.sources.espnOdds.ok, false);
+  assert.deepEqual(r1.snapshot.sources.espnOdds.errors, [`cfb: 62 of the 62 upcoming games listed in the previous run (${prev.at}) are missing from the scoreboards`]);
+  assert.equal(r1.hold, null, 'NFL games are still there');
+
+  // a few games gone (below vanishMin): not flagged
+  const few = researchInputs();
+  few.espn.scoreboards.nfl[0].events = few.espn.scoreboards.nfl[0].events.slice(PLAUSIBILITY.vanishMin - 1);
+  assert.equal(buildRun({ ...few, history: prev }, { now: later(5) }).snapshot.sources.espnOdds.ok, true);
+
+  // everything gone: held (the caller does not post it), and flagged
+  const none = researchInputs();
+  for (const b of allBoards(none)) b.events = [];
+  const r2 = buildRun({ ...none, history: prev }, { now: later(5) });
+  assert.equal(r2.snapshot.games.length, 0);
+  assert.deepEqual(r2.hold, { reason: `no games in this run, but the previous run (${prev.at}) listed 76 upcoming games`, prevAt: prev.at, prevUpcoming: 76 });
+  // Kalshi and ESPN both empty after a full run: held as well
+  assert.ok(buildRun({ ...none, kalshi: { ...none.kalshi, markets: {} }, history: prev }, { now: later(5) }).hold);
+  // the previous run is too old to compare with: not held (posted, flagged by the in-season check)
+  const old = buildRun({ ...none, history: prev }, { now: t0 + PLAUSIBILITY.prevMaxAgeMs + 60e3 });
+  assert.equal(old.hold, null);
+  assert.equal(old.snapshot.sources.espnOdds.ok, false);
+  // no history (first run): not held
+  assert.equal(buildRun(none, { now: later(5) }).hold, null);
 });

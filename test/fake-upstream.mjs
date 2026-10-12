@@ -2,12 +2,14 @@
 // Only the local fake site (127.0.0.1 / localhost) reaches the real fetch; every other host gets a canned answer
 // or a 404, so the test suite never touches the network (GitHub, ESPN core, sportsdataverse included).
 // FAKE_UPSTREAM: 'ok' (default) | 'kalshi-down' | 'espn-down' | 'all-down'
+//   | 'espn-empty' (ESPN answers 200 with an empty events list on every scoreboard, as during an ESPN incident)
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const DIR = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'research-20261011');
 const rd = (f) => readFileSync(join(DIR, f), 'utf8');
+const INJURIES = readFileSync(join(DIR, '..', 'angles', 'espn-injuries-raw-BAL-LAC.json'), 'utf8');
 const mode = process.env.FAKE_UPSTREAM || 'ok';
 const realFetch = globalThis.fetch;
 const json = (body, status = 200) => new Response(body, { status, headers: { 'content-type': 'application/json' } });
@@ -32,9 +34,13 @@ globalThis.fetch = async (input, init) => {
   if (url.hostname === 'site.api.espn.com') {
     if (mode === 'espn-down' || mode === 'all-down') return json('{}', 500);
     if (url.pathname.endsWith('/summary')) return json('{"injuries":[]}');
-    if (url.pathname.endsWith('/injuries')) return json('{"timestamp":"2026-10-11T22:00:00Z","injuries":[]}');
+    if (url.pathname.endsWith('/injuries')) return json(INJURIES);
     if (url.pathname.endsWith('/depthcharts')) return json('{"depthchart":[]}');
     if (url.searchParams.get('week')) return json('{"events":[]}');
+    if (mode === 'espn-empty' && url.pathname.endsWith('/scoreboard')) {
+      const b = JSON.parse(rd(url.pathname.includes('/nfl/') ? 'espn_nfl_w6.json' : 'espn_cfb_w7.json'));
+      return json(JSON.stringify({ ...b, events: [] }));
+    }
     return json(rd(url.pathname.includes('/nfl/') ? 'espn_nfl_w6.json' : 'espn_cfb_w7.json'));
   }
   // ESPN core (propBets: not posted), ESPN site.web (CFB byteam), GitHub (nflverse, sportsdataverse): unavailable.

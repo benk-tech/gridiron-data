@@ -20,9 +20,12 @@
 //   --quiet
 // Env (only for --post / --settle): INGEST_URL, INGEST_KEY. Neither is ever printed.
 //
-// Exit code: 1 when the Kalshi core series AND the ESPN scoreboards both failed (nothing usable; no POST is sent),
-// or when a POST to the site fails, or on bad usage/config. Partial source failures exit 0: they are recorded in
-// snapshot.sources.X.errors and the snapshot is still posted.
+// Exit code: 1 when nothing usable came back and no POST is sent: the Kalshi core series AND the ESPN scoreboards
+// both failed, or the run found no games at all while the previous run (state/history.json, at most 6 h old) listed
+// 10 or more upcoming games (an ESPN outage that answers 200 with empty lists). In both cases the last good snapshot
+// stays up and the run-to-run state is not saved. Also 1 when a POST to the site fails, or on bad usage/config.
+// Partial source failures exit 0: they are recorded in snapshot.sources.X.errors (ok=false) and the snapshot is
+// still posted.
 
 import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
@@ -150,9 +153,11 @@ async function main() {
     const kalshiCoreOk = CORE_SERIES_LIST.some((s) => Array.isArray(inputs.kalshi?.markets?.[s]));
     const espnOk = Object.values(inputs.espn?.scoreboards || {}).some((b) => b.length > 0);
     const bothDown = !kalshiCoreOk && !espnOk;
+    const held = bothDown ? null : run.hold; // an empty run right after a full one: keep the last good snapshot up
 
-    // Run-to-run state. Skipped when nothing usable came back: the same closes are found again next run.
-    if (stateDir && !bothDown) {
+    // Run-to-run state. Skipped when nothing usable came back: the same closes are found again next run, and the
+    // next run still compares with the last good history.
+    if (stateDir && !bothDown && !held) {
       try {
         const w = await writeClosesFile(join(stateDir, 'closes'), run.closes, { now: t0 });
         if (w.added) log(`closes: staged ${w.added} game(s) in ${w.files.length} day file(s)`);
@@ -173,6 +178,9 @@ async function main() {
 
     if (bothDown) {
       console.error('Kalshi core and ESPN odds both failed; snapshot not posted');
+      exit = 1;
+    } else if (held) {
+      console.error(`snapshot not posted: ${held.reason}. The last good snapshot stays up; state not saved.`);
       exit = 1;
     } else if (args.post) {
       try {

@@ -339,3 +339,21 @@ test('fetchInjuryInputs: a mostly failed depth refresh keeps old charts and wait
   assert.equal(b.requests, 1, 'inside the 30 minute back-off only the league feed is fetched');
   assert.equal(b.depthCached, true);
 });
+
+test('fetchInjuryInputs: a 200 answer without the injuries list is a failed feed (summaries fallback), not an empty one', async () => {
+  const t0 = Date.parse('2026-10-12T01:00:00Z');
+  const m = mockEspn();
+  const drifted = async (url, init) => (new URL(url).pathname.endsWith('/nfl/injuries')
+    ? new Response(JSON.stringify({ timestamp: '2026-10-12T00:00:00Z', teams: [{ id: '1', injuries: [{ status: 'Out' }] }] }), { status: 200 })
+    : m.fetchImpl(url, init));
+  const r = await fetchInjuryInputs({ fetchImpl: drifted, now: t0, pauseMs: 0, retryDelayMs: 0 });
+  assert.equal(r.league, null);
+  assert.ok(r.errors.includes('league injuries: unexpected JSON (no injuries list; keys: timestamp, teams)'), r.errors.join(' | '));
+  // an empty list is a valid (if suspicious) feed: the builder judges it against the games in the window
+  const emptyList = async (url, init) => (new URL(url).pathname.endsWith('/nfl/injuries')
+    ? new Response(JSON.stringify({ timestamp: '2026-10-12T00:00:00Z', injuries: [] }), { status: 200 })
+    : m.fetchImpl(url, init));
+  const e = await fetchInjuryInputs({ fetchImpl: emptyList, now: t0, pauseMs: 0, retryDelayMs: 0 });
+  assert.equal(e.league.count, 0);
+  assert.ok(!e.errors.some((x) => /league injuries/.test(x)));
+});

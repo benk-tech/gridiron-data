@@ -115,3 +115,38 @@ test('exit code: a rejected POST is a failure; missing env is a usage error', as
     site.server.close();
   }
 });
+
+test('ESPN answering 200 with empty scoreboards right after a full run: not posted, state kept, exit 1; posted (flagged) once the hold lapses', async () => {
+  const site = await fakeSite();
+  const tmp = mkdtempSync(join(tmpdir(), 'gd-cli-'));
+  try {
+    const env = { INGEST_URL: site.url, INGEST_KEY: KEY };
+    const stateDir = join(tmp, 'state');
+    const common = ['--post', '--cache-dir', '', '--state-dir', stateDir, '--closes-dir', join(tmp, 'closes'), '--skip', 'props,teamTotals,nflverse,cfb,injuries'];
+    const ok = await run([...common, '--now', '2026-10-11T22:51:00Z'], { ...env, FAKE_UPSTREAM: 'ok' });
+    assert.equal(ok.code, 0, ok.out);
+    assert.equal(site.state.snapshots.length, 1);
+    const histPath = join(stateDir, 'history.json');
+    const hist1 = readFileSync(histPath, 'utf8');
+
+    const empty = await run([...common, '--now', '2026-10-11T22:56:00Z'], { ...env, FAKE_UPSTREAM: 'espn-empty' });
+    assert.equal(empty.code, 1, empty.out);
+    assert.match(empty.out, /snapshot not posted: no games in this run, but the previous run \(2026-10-11T22:51:00Z\) listed 76 upcoming games/);
+    assert.match(empty.out, /source espnOdds: NOT OK .*lists no games/);
+    assert.equal(site.state.snapshots.length, 1, 'the last good snapshot stays up');
+    assert.equal(readFileSync(histPath, 'utf8'), hist1, 'state not saved, so the next run still compares with the good run');
+
+    // more than 6 hours after the last good run the hold lapses: the empty snapshot is posted, with ESPN flagged down
+    await new Promise((r) => setTimeout(r, 1100)); // the site rejects a POST timestamp (seconds) that is not newer
+    const later = await run([...common, '--now', '2026-10-12T04:56:00Z'], { ...env, FAKE_UPSTREAM: 'espn-empty' });
+    assert.equal(later.code, 0, later.out);
+    assert.equal(site.state.snapshots.length, 2);
+    const snap = JSON.parse(gunzipSync(site.state.snapshots[1]).toString('utf8'));
+    assert.equal(snap.games.length, 0);
+    assert.equal(snap.sources.espnOdds.ok, false);
+    assert.match(snap.sources.espnOdds.errors.join(' | '), /current regular season week lists no games/);
+  } finally {
+    site.server.close();
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});

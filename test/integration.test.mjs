@@ -227,3 +227,20 @@ test('CFB: school names in shortName, defense.cfb for slate teams, QB-change ang
   }
   assert.ok(s.cfbQbChanges.length >= 1, 'the live capture flagged at least one QB change on this slate');
 });
+
+test('plausibility: prop rungs and team total markets with no price at all are flagged (props, teamTotals ok=false)', () => {
+  const inp = phaseBInputs();
+  const strip = (arr) => { for (const m of arr || []) for (const k of Object.keys(m)) if (k.endsWith('_dollars')) delete m[k]; };
+  for (const arr of Object.values(inp.props.kalshi)) strip(arr);
+  for (const arr of Object.values(inp.teamTotals.kalshi)) strip(arr);
+  const s = buildSnapshot(inp, { now: NOW });
+  const rungs = s.props.flatMap((p) => p.rungs).length;
+  const tt = s.games.flatMap((g) => g.kalshi.markets.filter((m) => m.type === 'teamTotal')).length;
+  assert.ok(rungs >= 10, `rungs ${rungs}`);
+  assert.equal(s.sources.props.ok, false);
+  assert.ok(s.sources.props.errors.includes(`${rungs} prop rungs but none has a price (Kalshi format change?)`), s.sources.props.errors.join(' | '));
+  assert.ok(tt >= 10, `team total markets ${tt}`);
+  assert.equal(s.sources.teamTotals.ok, false);
+  assert.ok(s.sources.teamTotals.errors.includes(`${tt} team total markets but none has a price (Kalshi format change?)`), s.sources.teamTotals.errors.join(' | '));
+  assert.equal(s.sources.kalshi.ok, true, 'core markets still priced');
+});
