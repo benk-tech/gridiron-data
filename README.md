@@ -77,7 +77,7 @@ X-GP-Timestamp: ts
 X-GP-Signature: sig
 ```
 
-The HMAC key is the UTF-8 bytes of the `INGEST_KEY` string exactly as stored; the base64url text is not decoded first. `path` is the URL path without a query string, for example `/api/ingest`. The snapshot body is the gzip bytes with `Content-Type: application/octet-stream` and no `Content-Encoding` header.
+The HMAC key is the UTF-8 bytes of the `INGEST_KEY` string exactly as stored; the base64url text is not decoded first. `path` is the URL path without a query string, for example `/api/ingest`. The snapshot body is the gzip bytes with `Content-Type: application/octet-stream` and no `Content-Encoding` header. The snapshot POST also sends `X-GP-Generated: <snapshot.generatedAt>`, unsigned, so the site never has to parse the body; the site accepts it only within 15 minutes before to 1 minute after the signed timestamp and otherwise records the post time.
 
 ## Data notes
 

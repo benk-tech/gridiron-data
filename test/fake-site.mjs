@@ -29,6 +29,7 @@ export function fakeSite({ key = KEY } = {}) {
       if (req.headers['content-type'] !== 'application/octet-stream' || req.headers['content-encoding']) return send(400, { error: 'headers' });
       state.lastTs = Number(ts);
       state.snapshots.push(body);
+      state.generated = req.headers['x-gp-generated'] ?? null;
       return send(200, { ok: true, size: body.length });
     }
     if (req.method === 'GET' && url.pathname === PATHS.pending) return send(200, { tickers: state.pending });

@@ -38,6 +38,8 @@ test('postSnapshot / pending / settle against a local signature-checking server'
     assert.equal(r.status, 200);
     assert.equal(r.json.size, r.gzBytes);
     assert.equal(JSON.parse(gunzipSync(site.state.snapshots[0]).toString('utf8')).generatedAt, '2026-10-11T23:49:00Z');
+    // The build time rides along unsigned in X-GP-Generated (the Worker never parses the body).
+    assert.equal(site.state.generated, '2026-10-11T23:49:00Z');
     // Same-second resend is a replay and is refused by the server.
     const again = await postSnapshot(snap, { url: site.url, key: KEY, nowMs: site.state.lastTs * 1000 });
     assert.equal(again.status, 409);
