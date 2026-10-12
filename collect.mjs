@@ -15,6 +15,8 @@
 //   --skip-injuries    same as --skip injuries
 //   --kalshi-gap-ms N  minimum gap between Kalshi requests (default 250; Kalshi answers 429 to bursts on /markets)
 //   --save-inputs FILE.json.gz   raw fetched inputs (rebuild offline with scripts/build-fixture.mjs)
+//   --now ISO          run as if the clock read ISO (game window, generatedAt, history and closes times). For tests and
+//                      fixture rebuilds; request signatures and time budgets always use the real clock.
 //   --quiet
 // Env (only for --post / --settle): INGEST_URL, INGEST_KEY. Neither is ever printed.
 //
@@ -44,7 +46,7 @@ function version() {
   try { return `${JSON.parse(readFileSync(resolve(HERE, 'package.json'), 'utf8')).version}-local`; } catch { return 'local'; }
 }
 
-const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb] [--skip-injuries] [--kalshi-gap-ms N] [--save-inputs FILE.json.gz] [--quiet]';
+const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb] [--skip-injuries] [--kalshi-gap-ms N] [--save-inputs FILE.json.gz] [--now ISO] [--quiet]';
 
 async function main() {
   let args;
@@ -61,6 +63,7 @@ async function main() {
         'kalshi-gap-ms': { type: 'string' },
         'skip-injuries': { type: 'boolean', default: false },
         'save-inputs': { type: 'string' },
+        now: { type: 'string' },
         quiet: { type: 'boolean', default: false },
         help: { type: 'boolean', short: 'h', default: false },
       },
@@ -80,6 +83,15 @@ async function main() {
     console.error(`unknown --skip part(s): ${unknown.join(', ')} (known: ${PART_KEYS.join(', ')})\n${USAGE}`);
     return 2;
   }
+  const startMs = Date.now(); // real clock: timings and time budgets
+  let t0 = startMs; // the run's 'now': game window, generatedAt, history and closes
+  if (args.now != null) {
+    t0 = /^\d{4}-\d{2}-\d{2}T/.test(args.now) ? Date.parse(args.now) : NaN;
+    if (!Number.isFinite(t0)) {
+      console.error(`bad --now value (want an ISO time such as 2026-10-11T22:51:00Z)\n${USAGE}`);
+      return 2;
+    }
+  }
   const log = args.quiet ? () => {} : (...a) => console.log(...a);
   const ingest = { url: process.env.INGEST_URL || '', key: process.env.INGEST_KEY || '' };
   if ((args.post || args.settle) && (!ingest.url || !ingest.key)) {
@@ -90,7 +102,6 @@ async function main() {
   const closesDir = args['closes-dir'] ? resolve(args['closes-dir']) : resolve(HERE, 'closes');
 
   let exit = 0;
-  const t0 = Date.now();
 
   if (args.out || args.post) {
     const inputs = await collectInputs({
@@ -101,7 +112,7 @@ async function main() {
       ...(args['kalshi-gap-ms'] != null ? { kalshiGapMs: Math.max(0, Number(args['kalshi-gap-ms']) || 0) } : {}),
       log,
     });
-    const fetchMs = Date.now() - t0;
+    const fetchMs = Date.now() - startMs;
     const historyPath = stateDir ? join(stateDir, 'history.json') : null;
     inputs.history = historyPath ? await readHistoryFile(historyPath) : null;
 

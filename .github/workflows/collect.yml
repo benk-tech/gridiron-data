@@ -61,11 +61,13 @@ jobs:
             daily-${{ steps.keys.outputs.utc }}-
             daily-
 
-      - name: Offline tests
-        run: node --test test/*.test.mjs
-
+      # No test step here on purpose: a failing test would skip the collect step and every step after it, so the
+      # site would go stale. The offline tests run on push and pull request instead (test.yml).
+      # The collector stops fetching at its own time budget (about 100 s) and posts what it has; the step timeout is
+      # only a backstop that still leaves time for the always() steps below inside the 4 minute job.
       - id: collect
         name: Collect, post, settle
+        timeout-minutes: 3
         run: node collect.mjs --post --settle --cache-dir cache --state-dir state
         env:
           INGEST_URL: ${{ secrets.INGEST_URL }}

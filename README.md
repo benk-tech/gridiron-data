@@ -21,6 +21,8 @@ node collect.mjs --post --settle --cache-dir cache --state-dir state  # what the
 npm test                                                              # offline tests (node --test test/*.test.mjs)
 ```
 
+The offline tests run in `.github/workflows/test.yml` on every push and pull request. The scheduled `collect.yml` does not run them, so a failing test can never stop the collector from posting.
+
 Options:
 
 | Option | Meaning |
@@ -31,6 +33,7 @@ Options:
 | `--skip LIST` | skip optional parts: `props`, `teamTotals`, `injuries`, `nflverse`, `cfb` (`--skip-injuries` also works) |
 | `--kalshi-gap-ms N` | minimum gap between Kalshi requests, default 250 (Kalshi answers HTTP 429 to bursts on `/markets`) |
 | `--save-inputs FILE.json.gz` | keep the raw fetched inputs; `node scripts/build-fixture.mjs FILE.json.gz out.json` rebuilds the same snapshot offline |
+| `--now ISO` | run as if the clock read this time (game window, `generatedAt`, line history, closes); for tests and fixture rebuilds. Request signatures and time budgets always use the real clock. |
 | `--quiet` | no log lines |
 
 `--post` and `--settle` read `INGEST_URL` and `INGEST_KEY` from the environment (GitHub repository secrets). Neither value is ever printed.

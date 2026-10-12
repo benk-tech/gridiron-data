@@ -1,4 +1,6 @@
 // End to end through collect.mjs with Kalshi/ESPN replaced by the saved capture (preload) and a local signing site.
+// Every run is pinned to the capture time with --now, so the results never depend on the real date (the fixture games
+// leave the 9 day window in real time; the scheduled workflow must never depend on that).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -9,13 +11,18 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 import { KEY, fakeSite } from './fake-site.mjs';
 import { validateSnapshot } from '../lib/schema.mjs';
+import { RESEARCH_NOW } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PRELOAD = pathToFileURL(join(ROOT, 'test', 'fake-upstream.mjs')).href;
 
 function run(args, env) {
+  const extra = [
+    ...(args.includes('--out') || args.includes('--post') ? ['--kalshi-gap-ms', '0'] : []),
+    ...(args.includes('--now') ? [] : ['--now', RESEARCH_NOW]),
+  ];
   return new Promise((resolve) => {
-    const p = spawn(process.execPath, ['--import', PRELOAD, join(ROOT, 'collect.mjs'), ...args, ...(args.includes('--out') || args.includes('--post') ? ['--kalshi-gap-ms', '0'] : [])], {
+    const p = spawn(process.execPath, ['--import', PRELOAD, join(ROOT, 'collect.mjs'), ...args, ...extra], {
       cwd: ROOT, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
@@ -42,9 +49,11 @@ test('collect.mjs --post --settle --out: posts a valid signed snapshot, settles,
     assert.match(r.out, /moves: 0 game, 0 prop \(history since none\)/);
     // second run reads the history (no lines moved in the capture, so no moves)
     const outFile2 = join(tmp, 'snap2.json');
-    const r2 = await run(['--out', outFile2, '--cache-dir', join(tmp, 'cache'), '--state-dir', stateDir, '--closes-dir', join(tmp, 'closes'), '--skip', 'nflverse,cfb,injuries'], { FAKE_UPSTREAM: 'ok' });
+    const r2 = await run(['--out', outFile2, '--cache-dir', join(tmp, 'cache'), '--state-dir', stateDir, '--closes-dir', join(tmp, 'closes'), '--skip', 'nflverse,cfb,injuries', '--now', '2026-10-11T22:56:00Z'], { FAKE_UPSTREAM: 'ok' });
     assert.equal(r2.code, 0, r2.out);
     const snap2 = JSON.parse(readFileSync(outFile2, 'utf8'));
+    assert.equal(hist.at, '2026-10-11T22:51:00Z', 'the first run is pinned to the capture time');
+    assert.equal(snap2.generatedAt, '2026-10-11T22:56:00Z');
     assert.equal(snap2.sources.moves.since, hist.at);
     assert.deepEqual(validateSnapshot(snap2), []);
     assert.ok(!existsSync(join(tmp, 'closes')), 'nothing kicked off between the runs: no closes archived');
@@ -53,6 +62,8 @@ test('collect.mjs --post --settle --out: posts a valid signed snapshot, settles,
     assert.deepEqual(validateSnapshot(posted), []);
     assert.deepEqual(posted, JSON.parse(readFileSync(outFile, 'utf8')));
     assert.equal(posted.sources.kalshi.ok, true);
+    assert.equal(posted.generatedAt, '2026-10-11T22:51:00Z');
+    assert.equal(posted.games.length, 76, 'every fixture game is inside the window at the pinned time');
     assert.equal(site.state.settled.length, 1);
     assert.equal(site.state.settled[0].results.length, 2);
     assert.ok(!r.out.includes(KEY), 'key printed');
@@ -95,6 +106,11 @@ test('exit code: a rejected POST is a failure; missing env is a usage error', as
     const badSkip = await run(['--out', 'x.json', '--skip', 'weather'], {});
     assert.equal(badSkip.code, 2);
     assert.match(badSkip.out, /unknown --skip part/);
+    for (const bad of ['tomorrow', '', '12345']) {
+      const badNow = await run(['--out', 'x.json', '--now', bad], {});
+      assert.equal(badNow.code, 2, `--now ${JSON.stringify(bad)}`);
+      assert.match(badNow.out, /bad --now value/);
+    }
   } finally {
     site.server.close();
   }

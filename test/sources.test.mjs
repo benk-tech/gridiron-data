@@ -182,10 +182,15 @@ test('pacedFetch: Kalshi requests start minGapMs apart, a 429 is retried after R
   ]);
   assert.deepEqual(rs.map((r) => r.status), [200, 200, 200, 200]);
   assert.deepEqual(f.stats, { paced: 4, retried429: 1 });
+  // Lower bounds and ordering only: timers never fire early, but on a busy machine two late timers can fire back to
+  // back, so a pairwise gap or an upper bound on wall time would flake. The pacer books slot i at first + i x gap.
   const k = seen.filter(([u]) => u.includes('kalshi')).map(([, t]) => t);
-  for (let i = 1; i < k.length; i++) assert.ok(k[i] - k[i - 1] >= 40, `gap ${k[i] - k[i - 1]} ms (timer granularity allows about 15 ms of slack)`);
-  assert.ok(k[k.length - 1] - k[0] >= 3 * 60 - 20, 'four Kalshi starts span at least three gaps');
-  assert.ok(seen.find(([u]) => u.includes('espn'))[1] - t0 < 30, 'ESPN is not held behind Kalshi');
+  assert.equal(k.length, 4, 'A, B, C and the retry of A');
+  for (let i = 1; i < k.length; i++) assert.ok(k[i] - k[0] >= i * 60 - 15, `start ${i} at +${k[i] - k[0]} ms, booked for +${i * 60} ms`);
+  assert.ok(k[0] >= t0);
+  const iEspn = seen.findIndex(([u]) => u.includes('espn'));
+  assert.equal(iEspn, 0, 'ESPN went out at once, before any Kalshi request (not held behind the pacer)');
+  assert.ok(seen[iEspn][1] < k[1], 'ESPN started before the second Kalshi slot');
   // a persistent 429 is returned after retry429 extra attempts
   const always = pacedFetch(async () => new Response('', { status: 429 }), { minGapMs: 0, backoffMs: 0, retry429: 2, maxRetries429: 3 });
   assert.equal((await always('https://api.elections.kalshi.com/x')).status, 429);
