@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { FIX } from './helpers.mjs';
 import { parseCsv, colIndex } from '../lib/csv.mjs';
+import { withDeadline, BudgetError } from '../lib/http.mjs';
 import {
   buildNflverse, fetchNflverseInputs, nflverseEtag, bridgeToJSON, bridgeFromJSON, nflSeason, NFLVERSE_ASSETS, STAT_FN, SUPPORTED_STATS, propPlayersFromProps,
 } from '../lib/nflverse.mjs';
@@ -275,4 +276,84 @@ test('fetchNflverseInputs: a non-gzip download is an error for that asset only (
   assert.equal(Object.keys(built.defense.nfl).length, 32, 'defense still built without PFR (no pressure)');
   assert.equal(built.defense.nfl.ATL.front.pressureRate, null);
   assert.equal(built.defense.nfl.ATL.front.ranks.pressure, null);
+});
+
+// Negative cache: a missing asset with nothing cached (the season rollover on March 1 until the new season's files
+// appear) is asked for once per back-off, not on every 5 minute run.
+function releasesWithMissing({ missing = new Set(), missStatus = 404 } = {}) {
+  const m = mockReleases();
+  const calls = [];
+  const byUrl = Object.fromEntries(Object.keys(NFLVERSE_ASSETS).map((k) => [NFLVERSE_ASSETS[k](2026), k]));
+  const fetchImpl = async (url, init = {}) => {
+    calls.push(`${init.method || 'GET'} ${byUrl[url]}`);
+    if (missing.has(byUrl[url])) return new Response('Not Found', { status: missStatus });
+    return m.fetchImpl(url, init);
+  };
+  return { fetchImpl, calls, missing };
+}
+
+test('fetchNflverseInputs: a missing asset (404, nothing cached) is checked once per 6 hours with a HEAD only', async () => {
+  const cacheDir = await mkdtemp(join(tmpdir(), 'gp-nv-'));
+  const checkPath = join(await mkdtemp(join(tmpdir(), 'gp-nvs-')), 'nflverse-checks.json');
+  const t0 = Date.parse('2026-10-12T01:30:00Z');
+  const up = releasesWithMissing({ missing: new Set(['pbp', 'statsPlayerWeek', 'rosterWeekly', 'pfrDef']) });
+  const run = (min) => fetchNflverseInputs({ fetchImpl: up.fetchImpl, now: t0 + min * 60e3, cacheDir, checkPath, pauseMs: 0 });
+
+  const a = await run(0);
+  assert.deepEqual(up.calls, ['HEAD pbp', 'HEAD statsPlayerWeek', 'HEAD rosterWeekly', 'HEAD pfrDef'], 'a HEAD 404 is final: no GET');
+  assert.equal(a.requests, 4);
+  assert.equal(a.errors.length, 4);
+  assert.match(a.errors[0], /^pbp: .*play_by_play_2026\.csv\.gz: HTTP 404$/);
+  const misses = JSON.parse(readFileSync(checkPath, 'utf8')).misses;
+  assert.deepEqual(misses.pbp, { url: NFLVERSE_ASSETS.pbp(2026), at: '2026-10-12T01:30:00Z', status: 404, retryAfter: '2026-10-12T07:30:00Z' });
+
+  for (const min of [5, 10, 355]) {
+    up.calls.length = 0;
+    const r = await run(min);
+    assert.deepEqual(up.calls, [], `+${min} min: no request`);
+    assert.equal(r.requests, 0);
+    assert.deepEqual(r.errors.map((e) => e.split(':')[0]), ['pbp', 'statsPlayerWeek', 'rosterWeekly', 'pfrDef'], 'still reported as errors (ok=false)');
+    assert.match(r.errors[0], /^pbp: HTTP 404 at 2026-10-12T01:30:00Z; next try after 2026-10-12T07:30:00Z$/);
+  }
+
+  // after the back-off: pbp has been published, the other three are still missing
+  up.missing.delete('pbp');
+  up.calls.length = 0;
+  const b = await run(361);
+  assert.deepEqual(up.calls, ['HEAD pbp', 'GET pbp', 'HEAD statsPlayerWeek', 'HEAD rosterWeekly', 'HEAD pfrDef']);
+  assert.ok(b.pbp && b.cached.pbp === false);
+  assert.equal(b.errors.length, 3);
+  const misses2 = JSON.parse(readFileSync(checkPath, 'utf8')).misses;
+  assert.deepEqual(Object.keys(misses2).sort(), ['pfrDef', 'rosterWeekly', 'statsPlayerWeek'], 'the published asset is no longer a miss');
+  assert.equal(misses2.rosterWeekly.retryAfter, '2026-10-12T13:31:00Z');
+});
+
+test('fetchNflverseInputs: other failures back off 30 minutes; a spent time budget is not a miss; a cached copy is never a miss', async () => {
+  const cacheDir = await mkdtemp(join(tmpdir(), 'gp-nv-'));
+  const checkPath = join(await mkdtemp(join(tmpdir(), 'gp-nvs-')), 'nflverse-checks.json');
+  const t0 = Date.parse('2026-10-12T01:30:00Z');
+  const up = releasesWithMissing({ missing: new Set(['pfrDef']), missStatus: 503 });
+  const run = (min, fetchImpl = up.fetchImpl) => fetchNflverseInputs({ fetchImpl, now: t0 + min * 60e3, cacheDir, checkPath, pauseMs: 0 });
+  const a = await run(0);
+  assert.equal(a.requests, 3 * 2 + 2, 'pfrDef: HEAD 503, then the GET is tried (503)');
+  assert.deepEqual(a.errors, [`pfrDef: ${new URL(NFLVERSE_ASSETS.pfrDef(2026)).pathname}: HTTP 503`]);
+  up.calls.length = 0;
+  await run(10);
+  assert.deepEqual(up.calls, [], 'cached assets were checked < 30 min ago; pfrDef waits out its 30 minute back-off');
+  up.missing.clear();
+  up.calls.length = 0;
+  const c = await run(31);
+  assert.deepEqual(up.calls.filter((x) => x.endsWith('pfrDef')), ['HEAD pfrDef', 'GET pfrDef']);
+  assert.ok(c.pfrDef);
+
+  // the time budget ran out before the request: an error this run, but no back-off
+  const cache2 = await mkdtemp(join(tmpdir(), 'gp-nv-'));
+  const check2 = join(await mkdtemp(join(tmpdir(), 'gp-nvs-')), 'nflverse-checks.json');
+  const spent = withDeadline(up.fetchImpl, AbortSignal.abort(new BudgetError('nflverse time budget (75 s) spent')));
+  const d = await fetchNflverseInputs({ fetchImpl: spent, now: t0, cacheDir: cache2, checkPath: check2, pauseMs: 0 });
+  assert.equal(d.errors.length, 4);
+  assert.ok(d.errors.every((e) => /nflverse time budget \(75 s\) spent/.test(e)), d.errors.join(' | '));
+  const after = await fetchNflverseInputs({ fetchImpl: up.fetchImpl, now: t0 + 60e3, cacheDir: cache2, checkPath: check2, pauseMs: 0 });
+  assert.equal(after.requests, 8, 'retried at once on the next run');
+  assert.deepEqual(after.errors, []);
 });

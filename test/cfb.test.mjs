@@ -205,3 +205,33 @@ test('fetchCfbInputs: maxSummaries caps the weekly requests and marks the week f
   assert.equal(c.requests, 3 + 3, 'retry after the back-off (defense still cached for the day)');
   assert.equal(c.qb.complete, true);
 });
+
+test('fetchCfbInputs: a missing defense file (404) waits 6 hours; the piece that worked is kept and not fetched again', async () => {
+  const cacheDir = await mkdtemp(join(tmpdir(), 'gp-cfb-'));
+  const t0 = Date.parse('2026-10-12T01:30:00Z');
+  const m = mockCfb();
+  let dvpUp = false;
+  const fetchImpl = async (url, init) => (url === CFB_URLS.dvp(2026) && !dvpUp ? new Response('Not Found', { status: 404 }) : m.fetchImpl(url, init));
+  const run = (h) => fetchCfbInputs({ fetchImpl, now: t0 + h * 3600e3, cacheDir, pauseMs: 0, retryDelayMs: 0 });
+
+  const a = await run(0);
+  assert.equal(a.requests, 2 + 3 + 3);
+  assert.ok(a.errors.some((e) => /^cfb dvp: .*cfb_defense_vs_position_2026\.csv: HTTP 404$/.test(e)), a.errors.join(' | '));
+  assert.ok(a.defense.byTeam && !a.defense.dvp);
+
+  for (const h of [5 / 60, 1, 5.9]) {
+    const b = await run(h);
+    assert.equal(b.requests, 0, `+${h} h: no request (dvp backs off, byteam kept, weekly QB data cached)`);
+    assert.ok(b.defense.byTeam, 'byteam from the cache');
+    assert.ok(b.errors.some((e) => /^cfb dvp: .*HTTP 404; next try after 2026-10-12T07:30:00Z$/.test(e)), b.errors.join(' | '));
+  }
+
+  dvpUp = true;
+  const c = await run(6.1);
+  assert.equal(c.requests, 1, 'only the missing piece is fetched');
+  assert.deepEqual(c.errors, []);
+  assert.ok(c.defense.dvp.startsWith('season,team_id') && c.defense.byTeam);
+  const d = await run(7);
+  assert.equal(d.requests, 0);
+  assert.equal(d.defense.cached, true);
+});
