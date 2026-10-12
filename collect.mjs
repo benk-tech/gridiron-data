@@ -1,12 +1,21 @@
 #!/usr/bin/env node
-// Gridiron data collector (public data only: Kalshi markets, ESPN scoreboards and summaries).
+// Gridiron data collector (public data only: Kalshi markets, ESPN scoreboards, injuries and DK prop lines,
+// nflverse and sportsdataverse stats).
 //
 //   node collect.mjs --out snapshot.json      fetch, build, write the snapshot JSON
 //   node collect.mjs --post                   fetch, build, gzip + sign + POST to $INGEST_URL/api/ingest
 //   node collect.mjs --settle                 pending/settle handshake only (or together with --post)
 //
-// Options: --cache-dir DIR (daily cache, default .cache), --skip-injuries, --quiet,
-//          --save-inputs FILE.json.gz (raw fetched inputs, rebuild offline with scripts/build-fixture.mjs)
+// Options:
+//   --cache-dir DIR    daily data (fees, nflverse, depth charts, CFB), default .cache; '' = no cache
+//   --state-dir DIR    run-to-run state: history.json (line moves, last 48 h), closes/ (staged closes), nflverse
+//                      check stamps. Without it every run is a first run (no moves, no closes).
+//   --closes-dir DIR   where finished ET days of closes are copied (default: closes/ next to this file); only with --state-dir
+//   --skip LIST        comma list of optional parts to skip: props,teamTotals,injuries,nflverse,cfb
+//   --skip-injuries    same as --skip injuries
+//   --kalshi-gap-ms N  minimum gap between Kalshi requests (default 250; Kalshi answers 429 to bursts on /markets)
+//   --save-inputs FILE.json.gz   raw fetched inputs (rebuild offline with scripts/build-fixture.mjs)
+//   --quiet
 // Env (only for --post / --settle): INGEST_URL, INGEST_KEY. Neither is ever printed.
 //
 // Exit code: 1 when the Kalshi core series AND the ESPN scoreboards both failed (nothing usable; no POST is sent),
@@ -17,14 +26,16 @@ import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { gzipSync } from 'node:zlib';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collectInputs } from './lib/sources.mjs';
-import { buildSnapshot, summarize } from './lib/build.mjs';
+import { collectInputs, PART_KEYS } from './lib/sources.mjs';
+import { buildRun, summarize } from './lib/build.mjs';
 import { validateSnapshot } from './lib/schema.mjs';
 import { packSnapshot, postSnapshot, settleHandshake } from './lib/ingest.mjs';
 import { CORE_SERIES_LIST, createKalshiClient } from './lib/kalshi.mjs';
 import { createHttp, errorText } from './lib/http.mjs';
+import { readHistoryFile, writeHistoryFile } from './lib/moves.mjs';
+import { writeClosesFile, syncClosesDir } from './lib/closes.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -33,7 +44,7 @@ function version() {
   try { return `${JSON.parse(readFileSync(resolve(HERE, 'package.json'), 'utf8')).version}-local`; } catch { return 'local'; }
 }
 
-const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--skip-injuries] [--save-inputs FILE.json.gz] [--quiet]';
+const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb] [--skip-injuries] [--kalshi-gap-ms N] [--save-inputs FILE.json.gz] [--quiet]';
 
 async function main() {
   let args;
@@ -44,6 +55,10 @@ async function main() {
         post: { type: 'boolean', default: false },
         settle: { type: 'boolean', default: false },
         'cache-dir': { type: 'string', default: '.cache' },
+        'state-dir': { type: 'string' },
+        'closes-dir': { type: 'string' },
+        skip: { type: 'string', default: '' },
+        'kalshi-gap-ms': { type: 'string' },
         'skip-injuries': { type: 'boolean', default: false },
         'save-inputs': { type: 'string' },
         quiet: { type: 'boolean', default: false },
@@ -58,12 +73,21 @@ async function main() {
     console.error(USAGE);
     return args.help ? 0 : 2;
   }
+  const skip = new Set(String(args.skip || '').split(',').map((x) => x.trim()).filter(Boolean));
+  if (args['skip-injuries']) skip.add('injuries');
+  const unknown = [...skip].filter((x) => !PART_KEYS.includes(x));
+  if (unknown.length) {
+    console.error(`unknown --skip part(s): ${unknown.join(', ')} (known: ${PART_KEYS.join(', ')})\n${USAGE}`);
+    return 2;
+  }
   const log = args.quiet ? () => {} : (...a) => console.log(...a);
   const ingest = { url: process.env.INGEST_URL || '', key: process.env.INGEST_KEY || '' };
   if ((args.post || args.settle) && (!ingest.url || !ingest.key)) {
     console.error('INGEST_URL and INGEST_KEY must be set for --post / --settle');
     return 2;
   }
+  const stateDir = args['state-dir'] ? resolve(args['state-dir']) : null;
+  const closesDir = args['closes-dir'] ? resolve(args['closes-dir']) : resolve(HERE, 'closes');
 
   let exit = 0;
   const t0 = Date.now();
@@ -72,10 +96,19 @@ async function main() {
     const inputs = await collectInputs({
       now: t0,
       cacheDir: args['cache-dir'] ? resolve(args['cache-dir']) : null,
-      injuryLeagues: args['skip-injuries'] ? [] : ['nfl'],
+      stateDir,
+      parts: Object.fromEntries(PART_KEYS.map((k) => [k, !skip.has(k)])),
+      ...(args['kalshi-gap-ms'] != null ? { kalshiGapMs: Math.max(0, Number(args['kalshi-gap-ms']) || 0) } : {}),
       log,
     });
-    const snapshot = buildSnapshot(inputs, { now: t0, version: version(), runMs: Date.now() - t0 });
+    const fetchMs = Date.now() - t0;
+    const historyPath = stateDir ? join(stateDir, 'history.json') : null;
+    inputs.history = historyPath ? await readHistoryFile(historyPath) : null;
+
+    const b0 = Date.now();
+    const run = buildRun(inputs, { now: t0, version: version(), runMs: fetchMs });
+    const buildMs = Date.now() - b0;
+    const { snapshot } = run;
     if (args['save-inputs']) {
       const f = resolve(args['save-inputs']);
       await mkdir(dirname(f), { recursive: true });
@@ -85,10 +118,15 @@ async function main() {
     const pack = packSnapshot(snapshot);
     const sum = summarize(snapshot);
 
-    log(`snapshot ${snapshot.generatedAt}  ${(pack.rawBytes / 1024).toFixed(0)} KB raw, ${(pack.gzBytes / 1024).toFixed(0)} KB gzip, ${snapshot.collector.runMs} ms`);
-    log(`requests: kalshi ${inputs.stats.kalshiRequests}, espn ${inputs.stats.espnRequests}`);
+    log(`snapshot ${snapshot.generatedAt}  ${(pack.rawBytes / 1024).toFixed(0)} KB raw, ${(pack.gzBytes / 1024).toFixed(0)} KB gzip; fetch ${fetchMs} ms, build ${buildMs} ms`);
+    log(`requests: ${inputs.stats.totalRequests} total (kalshi ${inputs.stats.kalshiRequests}, espn ${inputs.stats.espnRequests})`);
+    for (const [name, s] of Object.entries(inputs.stats.bySource || {})) log(`  ${name.padEnd(10)} ${String(s.requests).padStart(3)} req ${String(s.ms).padStart(6)} ms`);
     for (const [lg, b] of Object.entries(sum.byLeague)) log(`${lg}: ${b.games} games (${b.pre || 0} pre, ${b.in || 0} in), ${b.withKalshi} on Kalshi, ${b.withOdds} with DK odds, ${b.markets} markets`);
-    log(`markets: ${sum.markets} (game ${sum.marketsByType.game}, spread ${sum.marketsByType.spread}, total ${sum.marketsByType.total}); ladders on ${sum.withLadders} games; combo eligible ${sum.comboEligible}; unmatched kalshi ${sum.unmatchedKalshi}, espn ${sum.unmatchedEspn}`);
+    const mt = sum.marketsByType;
+    log(`markets: ${sum.markets} (game ${mt.game}, spread ${mt.spread}, total ${mt.total}, team total ${mt.teamTotal}); ladders on ${sum.withLadders} games, team totals on ${sum.withTeamTotals}, DK team totals on ${sum.dkTeamTotals}; combo eligible ${sum.comboEligible}; unmatched kalshi ${sum.unmatchedKalshi}, espn ${sum.unmatchedEspn}`);
+    log(`props: ${sum.props} ladders (${sum.propRungs} rungs), ${sum.propsMatched} joined to ESPN players, ${sum.propsWithDk} with a DK line (${sum.propsSafe} safe)`);
+    log(`injuries: ${sum.injuries} listed; angles ${sum.angles} ${JSON.stringify(sum.anglesByKind)}; defense nfl ${sum.defenseNfl}, cfb ${sum.defenseCfb}; players ${sum.players}; cfb QB changes ${sum.cfbQbChanges}`);
+    log(`moves: ${sum.gameMoves} game, ${sum.propMoves} prop (history since ${snapshot.sources.moves.since ?? 'none'}); closes this run ${run.closes.length}`);
     for (const [k, s] of Object.entries(snapshot.sources)) {
       log(`source ${k}: ${s.ok ? 'ok' : 'NOT OK'}${s.errors.length ? `  ${s.errors.slice(0, 5).join(' | ')}${s.errors.length > 5 ? ` (+${s.errors.length - 5})` : ''}` : ''}`);
     }
@@ -98,6 +136,19 @@ async function main() {
     const kalshiCoreOk = CORE_SERIES_LIST.some((s) => Array.isArray(inputs.kalshi?.markets?.[s]));
     const espnOk = Object.values(inputs.espn?.scoreboards || {}).some((b) => b.length > 0);
     const bothDown = !kalshiCoreOk && !espnOk;
+
+    // Run-to-run state. Skipped when nothing usable came back: the same closes are found again next run.
+    if (stateDir && !bothDown) {
+      try {
+        const w = await writeClosesFile(join(stateDir, 'closes'), run.closes, { now: t0 });
+        if (w.added) log(`closes: staged ${w.added} game(s) in ${w.files.length} day file(s)`);
+        await writeHistoryFile(historyPath, run.history);
+        const sy = await syncClosesDir(join(stateDir, 'closes'), closesDir, { now: t0 });
+        if (sy.changed.length) log(`closes: ${sy.changed.length} finished day file(s) copied to the archive`);
+      } catch (e) {
+        console.warn(`state not saved: ${errorText(e)}`);
+      }
+    }
 
     if (args.out) {
       const out = resolve(args.out);

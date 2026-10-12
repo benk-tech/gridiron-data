@@ -26,13 +26,25 @@ test('research capture -> valid snapshot v1 with 14 NFL + 62 FBS games, all matc
   assert.ok(s.sources.kalshi.ok && s.sources.espnOdds.ok && s.sources.combos.ok && s.sources.fees.ok);
   assert.equal(s.sources.combos.collection, 'KXMVECROSSCATEGORY-R');
   assert.deepEqual(s.fees.KXNFLSPREAD, { feeType: 'quadratic_with_maker_fees', multiplier: 1 });
-  // Phase B placeholders.
+  // Phase B parts not in these inputs: empty, flagged 'not fetched' (test/integration.test.mjs covers them filled).
   assert.deepEqual(s.props, []);
   assert.deepEqual(s.defense, { nfl: {}, cfb: {} });
   assert.deepEqual(s.players, {});
-  for (const k of ['props', 'nflverse']) { assert.equal(s.sources[k].ok, false); assert.deepEqual(s.sources[k].errors, ['not implemented yet']); }
-  assert.equal(s.sources.injuries.ok, false);
-  assert.deepEqual(s.sources.injuries.errors, ['pending phase B']);
+  assert.deepEqual(s.cfbQbChanges, []);
+  for (const k of ['props', 'nflverse', 'injuries', 'teamTotals', 'cfb']) { assert.equal(s.sources[k].ok, false, k); assert.deepEqual(s.sources[k].errors, ['not fetched'], k); }
+  assert.equal(s.sources.moves.ok, true);
+  assert.equal(s.sources.moves.since, null);
+  for (const g of s.games) {
+    assert.deepEqual(g.angles, []);
+    assert.deepEqual(g.moves, []);
+    assert.equal(g.dkTeamTotals, null);
+    assert.equal(g.kalshi.teamTotalEvent, null);
+  }
+  // CFB team labels: the school (ESPN location), NFL keeps the nickname.
+  const cfbGame = s.games.find((g) => g.league === 'cfb' && g.away.abbr === 'MSST');
+  assert.equal(cfbGame?.away.shortName, 'Mississippi State');
+  assert.equal(s.games.find((g) => g.league === 'cfb' && g.away.abbr === 'WKU')?.away.shortName, 'Western Kentucky');
+  for (const g of s.games.filter((x) => x.league === 'nfl')) assert.equal(g.home.shortName, g.home.name.split(' ').pop(), g.home.name);
 });
 
 test('every spread market in the snapshot is on the right team (checked against ESPN names)', () => {

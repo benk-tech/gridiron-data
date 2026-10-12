@@ -1,0 +1,114 @@
+# Collector: fetch public Kalshi + ESPN (+ nflverse daily) data, build the snapshot, POST it signed to the site,
+# settle tracked picks, and archive pregame DraftKings closes. Runs about every 5 minutes; GitHub delays scheduled
+# runs under load, so gaps of several minutes are normal.
+# Repository secrets: INGEST_URL (site origin) and INGEST_KEY. Only the collect step sees them, and the collector
+# never prints them.
+name: collect
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  collect:
+    # Node 22 is the image's default node, so there is no setup-node step. Pinned to 24.04 because ubuntu-latest
+    # moves to 26.04 (Node 24) in November 2026.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    permissions:
+      contents: write   # only for the closes archive commit
+    concurrency:
+      group: collect
+      cancel-in-progress: false   # never cancel a run that may be mid-POST; a newer pending run replaces an older pending one
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0   # full history (the repo is small) so the closes commit can rebase onto main
+
+      - id: keys
+        name: Folders and cache keys
+        run: |
+          node --version
+          mkdir -p state cache
+          echo "utc=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      # state/ = history.json (last 48 h of DK lines, for line moves) and state/closes/ (closes staged until their
+      # ET day is over). Cache keys are immutable: every run saves a new key and the next run restores the newest.
+      - id: state
+        name: Restore state
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      # cache/ = daily data (fees, nflverse, rosters, depth charts), keyed by UTC date plus a hash of its contents,
+      # so a refresh later in the day (nflverse rebuilds after the late games) is saved once instead of refetched
+      # on every run. A new day starts from the newest earlier cache.
+      - id: daily
+        name: Restore daily cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: cache
+          key: daily-${{ steps.keys.outputs.utc }}
+          restore-keys: |
+            daily-${{ steps.keys.outputs.utc }}-
+            daily-
+
+      - name: Offline tests
+        run: node --test test/*.test.mjs
+
+      - id: collect
+        name: Collect, post, settle
+        run: node collect.mjs --post --settle --cache-dir cache --state-dir state
+        env:
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+          INGEST_KEY: ${{ secrets.INGEST_KEY }}
+
+      # Finished ET days move from state/closes/ into closes/ and are committed: about one commit per game day,
+      # which also keeps this scheduled workflow from being disabled for inactivity.
+      - name: Commit closes archive
+        if: ${{ always() && steps.collect.outcome != 'skipped' }}
+        run: |
+          node lib/closes.mjs sync state/closes closes
+          if [ -d closes ]; then git add closes; fi
+          if git diff --cached --quiet; then echo "closes: nothing new to commit"; exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -q -m "closes: pregame DraftKings lines at kickoff"
+          for i in 1 2 3; do
+            if git pull -q --rebase origin "$GITHUB_REF_NAME" && git push -q origin "HEAD:$GITHUB_REF_NAME"; then
+              echo "closes: pushed"
+              exit 0
+            fi
+            sleep $((i * 10))
+          done
+          echo "::warning::closes push failed 3 times; the files stay staged in state/closes and the next run retries"
+
+      - name: Save state
+        if: ${{ always() && steps.collect.outcome != 'skipped' }}
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - id: dailykey
+        name: Daily cache key
+        if: ${{ always() && steps.collect.outcome != 'skipped' }}
+        run: |
+          find cache -type f -mtime +10 -delete
+          if [ -z "$(find cache -type f -print -quit)" ]; then echo "key=" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "key=daily-${{ steps.keys.outputs.utc }}-$(find cache -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Save daily cache
+        if: ${{ always() && steps.dailykey.outputs.key != '' && steps.dailykey.outputs.key != steps.daily.outputs.cache-matched-key }}
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: cache
+          key: ${{ steps.dailykey.outputs.key }}

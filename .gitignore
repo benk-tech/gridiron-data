@@ -3,3 +3,6 @@ node_modules/
 /snapshot*.json
 *.log
 .env
+# collector run state and daily cache (GitHub Actions cache, never committed)
+/state/
+/cache/
