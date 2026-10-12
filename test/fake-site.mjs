@@ -32,7 +32,14 @@ export function fakeSite({ key = KEY } = {}) {
       state.generated = req.headers['x-gp-generated'] ?? null;
       return send(200, { ok: true, size: body.length });
     }
-    if (req.method === 'GET' && url.pathname === PATHS.pending) return send(200, { tickers: state.pending });
+    if (req.method === 'GET' && url.pathname === PATHS.pending) {
+      // The Worker's shape (src/ingest.js pending, migration 0003): tickers = ticker strings for older collectors,
+      // items = [{ ticker, kickoff }] in the same order. A plain string entry in state.pending stands for a row
+      // without a kickoff. state.pendingShape 'legacy' answers like a site from before migration 0003.
+      if (state.pendingShape === 'legacy') return send(200, { tickers: state.pending });
+      const items = state.pending.map((p) => (typeof p === 'string' ? { ticker: p, kickoff: null } : p));
+      return send(200, { tickers: items.map((i) => i.ticker), items });
+    }
     if (req.method === 'POST' && url.pathname === PATHS.settle) { state.settled.push(JSON.parse(body.toString('utf8'))); return send(200, { ok: true }); }
     return send(404, { error: 'not found' });
   });

@@ -109,8 +109,16 @@ test('getPending / getPendingItems accept both forms from the site', async () =>
   const site = await fakeSite();
   try {
     site.state.pending = [{ ticker: ATL4, kickoff: KO_ATL4 }, 'KXNFLGAME-26OCT11SFSEA-SEA'];
+    // The Worker's shape: { tickers: [strings], items: [{ ticker, kickoff }] }; the kickoff comes from items.
     assert.deepEqual(await getPendingItems({ url: site.url, key: KEY }), [{ ticker: ATL4, kickoff: KO_ATL4 }, { ticker: 'KXNFLGAME-26OCT11SFSEA-SEA', kickoff: null }]);
     assert.deepEqual(await getPending({ url: site.url, key: KEY }), [ATL4, 'KXNFLGAME-26OCT11SFSEA-SEA']);
+    // An older site (tickers only, plain strings): the same tickers, no kickoffs, so no close lookups.
+    site.state.pendingShape = 'legacy';
+    site.state.pending = [ATL4, 'KXNFLGAME-26OCT11SFSEA-SEA'];
+    assert.deepEqual(await getPendingItems({ url: site.url, key: KEY }), [{ ticker: ATL4, kickoff: null }, { ticker: 'KXNFLGAME-26OCT11SFSEA-SEA', kickoff: null }]);
+    // tickers-only holding objects is still read (the form this collector was first written against)
+    site.state.pending = [{ ticker: ATL4, kickoff: KO_ATL4 }];
+    assert.deepEqual(await getPendingItems({ url: site.url, key: KEY }), [{ ticker: ATL4, kickoff: KO_ATL4 }]);
   } finally {
     site.server.close();
   }
