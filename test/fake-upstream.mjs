@@ -3,7 +3,11 @@
 // or a 404, so the test suite never touches the network (GitHub, ESPN core, sportsdataverse included).
 // FAKE_UPSTREAM: 'ok' (default) | 'kalshi-down' | 'espn-down' | 'all-down'
 //   | 'espn-empty' (ESPN answers 200 with an empty events list on every scoreboard, as during an ESPN incident)
+// FAKE_PINNACLE: unset (default: the Pinnacle host answers 404 like any unknown host) | 'ok' (the 2026-10-12 capture,
+//   with its Last-Modified headers) | 'block' (HTTP 403, as a block of the runner's IP would look)
+// Kalshi /markets/trades serves the saved trades of the tickers in test/fixtures/clv (an empty list for any other).
 import { readFileSync, existsSync } from 'node:fs';
+import { gunzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -14,12 +18,28 @@ const mode = process.env.FAKE_UPSTREAM || 'ok';
 const realFetch = globalThis.fetch;
 const json = (body, status = 200) => new Response(body, { status, headers: { 'content-type': 'application/json' } });
 const SERIES = JSON.parse(rd('series.json'));
+const gz = (...p) => JSON.parse(gunzipSync(readFileSync(join(DIR, '..', ...p))).toString('utf8'));
+const pinMode = process.env.FAKE_PINNACLE || '';
+const PIN = pinMode === 'ok' ? gz('pinnacle', 'pinnacle-20261012.json.gz') : null;
+const PIN_LEAGUE = { 889: 'nfl', 880: 'cfb' };
 
 globalThis.fetch = async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input.url);
   if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') return realFetch(input, init);
+  if (url.hostname === 'guest.api.arcadia.pinnacle.com' && pinMode) {
+    if (pinMode === 'block') return json('{"error":"forbidden"}', 403);
+    const m = /\/leagues\/(\d+)\/(matchups|markets\/straight)$/.exec(url.pathname);
+    const part = m && PIN[PIN_LEAGUE[m[1]]]?.[m[2] === 'matchups' ? 'matchups' : 'straight'];
+    if (part) return new Response(JSON.stringify(part.body), { status: 200, headers: { 'content-type': 'application/json', 'last-modified': part.lastModified } });
+    return json('[]', 404);
+  }
   if (url.hostname.endsWith('kalshi.com')) {
     if (mode === 'kalshi-down' || mode === 'all-down') return json('{"error":"down"}', 503);
+    if (url.pathname.endsWith('/markets/trades')) {
+      const t = url.searchParams.get('ticker') || '';
+      const f = join(DIR, '..', 'clv', `trades-${t}.json.gz`);
+      return json(JSON.stringify({ cursor: '', trades: existsSync(f) ? gz('clv', `trades-${t}.json.gz`).trades : [] }));
+    }
     if (url.pathname.endsWith('/markets')) {
       const s = url.searchParams.get('series_ticker');
       if (s) return existsSync(join(DIR, `kalshi_${s}.json`)) ? json(rd(`kalshi_${s}.json`)) : json('{"cursor":"","markets":[]}');

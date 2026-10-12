@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 // Gridiron data collector (public data only: Kalshi markets, ESPN scoreboards, injuries and DK prop lines,
-// nflverse and sportsdataverse stats).
+// nflverse and sportsdataverse stats, Pinnacle guest prices).
 //
 //   node collect.mjs --out snapshot.json      fetch, build, write the snapshot JSON
 //   node collect.mjs --post                   fetch, build, gzip + sign + POST to $INGEST_URL/api/ingest
-//   node collect.mjs --settle                 pending/settle handshake only (or together with --post)
+//   node collect.mjs --settle                 pending/settle handshake only (or together with --post), with Kalshi
+//                                             kickoff closes (closeYes) when the site lists { ticker, kickoff }
 //
 // Options:
 //   --cache-dir DIR    daily data (fees, nflverse, depth charts, CFB), default .cache; '' = no cache
 //   --state-dir DIR    run-to-run state: history.json (line moves, last 48 h), closes/ (staged closes), nflverse
-//                      check stamps. Without it every run is a first run (no moves, no closes).
+//                      check stamps, pinnacle.json (last Pinnacle pull, reused for 15 min), clv-closes.json (Kalshi
+//                      kickoff closes waiting for their settlement). Without it every run is a first run.
 //   --closes-dir DIR   where finished ET days of closes are copied (default: closes/ next to this file); only with --state-dir
-//   --skip LIST        comma list of optional parts to skip: props,teamTotals,injuries,nflverse,cfb
+//   --skip LIST        comma list of optional parts to skip: props,teamTotals,injuries,nflverse,cfb,pinnacle
 //   --skip-injuries    same as --skip injuries
 //   --kalshi-gap-ms N  minimum gap between Kalshi requests (default 250; Kalshi answers 429 to bursts on /markets)
 //   --save-inputs FILE.json.gz   raw fetched inputs (rebuild offline with scripts/build-fixture.mjs)
@@ -38,7 +40,7 @@ import { buildRun, summarize } from './lib/build.mjs';
 import { validateSnapshot } from './lib/schema.mjs';
 import { packSnapshot, postSnapshot, settleHandshake } from './lib/ingest.mjs';
 import { CORE_SERIES_LIST, createKalshiClient } from './lib/kalshi.mjs';
-import { createHttp, errorText, withDeadline, budgetSignal } from './lib/http.mjs';
+import { createHttp, errorText, withDeadline, budgetSignal, pacedFetch } from './lib/http.mjs';
 import { readHistoryFile, writeHistoryFile } from './lib/moves.mjs';
 import { writeClosesFile, syncClosesDir } from './lib/closes.mjs';
 
@@ -51,7 +53,7 @@ function version() {
   try { return `${JSON.parse(readFileSync(resolve(HERE, 'package.json'), 'utf8')).version}-local`; } catch { return 'local'; }
 }
 
-const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb] [--skip-injuries] [--kalshi-gap-ms N] [--save-inputs FILE.json.gz] [--now ISO] [--quiet]';
+const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb,pinnacle] [--skip-injuries] [--kalshi-gap-ms N] [--save-inputs FILE.json.gz] [--now ISO] [--quiet]';
 
 async function main() {
   let args;
@@ -107,6 +109,10 @@ async function main() {
   const closesDir = args['closes-dir'] ? resolve(args['closes-dir']) : resolve(HERE, 'closes');
 
   let exit = 0;
+  // One Kalshi pacer for the whole run: the collection and the settle handshake (markets, kickoff close trades) share
+  // its request spacing and its per-run cap on 429 retries. Other hosts pass straight through it.
+  const gap = args['kalshi-gap-ms'] != null ? Math.max(0, Number(args['kalshi-gap-ms']) || 0) : 250;
+  const pacer = pacedFetch(globalThis.fetch, { minGapMs: gap, backoffMs: gap ? 1500 : 0 });
 
   if (args.out || args.post) {
     const inputs = await collectInputs({
@@ -114,7 +120,7 @@ async function main() {
       cacheDir: args['cache-dir'] ? resolve(args['cache-dir']) : null,
       stateDir,
       parts: Object.fromEntries(PART_KEYS.map((k) => [k, !skip.has(k)])),
-      ...(args['kalshi-gap-ms'] != null ? { kalshiGapMs: Math.max(0, Number(args['kalshi-gap-ms']) || 0) } : {}),
+      pacer,
       log,
     });
     const fetchMs = Date.now() - startMs;
@@ -144,6 +150,7 @@ async function main() {
     log(`props: ${sum.props} ladders (${sum.propRungs} rungs), ${sum.propsMatched} joined to ESPN players, ${sum.propsWithDk} with a DK line (${sum.propsSafe} safe)`);
     log(`injuries: ${sum.injuries} listed; angles ${sum.angles} ${JSON.stringify(sum.anglesByKind)}; defense nfl ${sum.defenseNfl}, cfb ${sum.defenseCfb}; players ${sum.players}; cfb QB changes ${sum.cfbQbChanges}`);
     log(`moves: ${sum.gameMoves} game, ${sum.propMoves} prop (history since ${snapshot.sources.moves.since ?? 'none'}); closes this run ${run.closes.length}`);
+    log(`pinnacle: ${Object.entries(sum.pinnacle).sort(([a], [b]) => (a < b ? 1 : -1)).map(([lg, b]) => `${lg} ${b.refs}/${b.pre} pregame games (${b.offBoard} off the board)`).join(', ')}; ${inputs.pinnacle ? (inputs.pinnacle.cached ? `reused the pull from ${inputs.pinnacle.attemptAt}` : `pulled, ${inputs.pinnacle.requests} requests`) : 'not fetched'}; unmatched ${snapshot.unmatched.pinnacle?.length ?? 0}`);
     for (const [k, s] of Object.entries(snapshot.sources)) {
       log(`source ${k}: ${s.ok ? 'ok' : 'NOT OK'}${s.errors.length ? `  ${s.errors.slice(0, 5).join(' | ')}${s.errors.length > 5 ? ` (+${s.errors.length - 5})` : ''}` : ''}`);
     }
@@ -198,8 +205,8 @@ async function main() {
     const budget = budgetSignal(SETTLE_BUDGET_MS, 'settle');
     try {
       const fetchImpl = withDeadline(globalThis.fetch, budget.signal);
-      const kalshi = createKalshiClient({ http: createHttp({ fetchImpl, retries: 0 }) });
-      await settleHandshake({ url: ingest.url, key: ingest.key, kalshi, fetchImpl, log });
+      const kalshi = createKalshiClient({ http: createHttp({ fetchImpl: withDeadline(pacer, budget.signal), retries: 0 }) });
+      await settleHandshake({ url: ingest.url, key: ingest.key, kalshi, fetchImpl, log, now: t0, stateDir });
     } catch (e) {
       // A failed settle is retried on the next run; it does not fail the job.
       console.warn(`settle skipped: ${errorText(e)}`);

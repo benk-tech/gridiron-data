@@ -8,6 +8,8 @@ It reads public, unauthenticated endpoints only:
 - ESPN site API scoreboards (DraftKings lines, current and opening), the NFL league injuries feed and team depth charts, and game summaries (only as a fallback when the injuries feed fails, and for the weekly college QB check).
 - ESPN core API DraftKings prop lines (`propBets`) for NFL games kicking off within 48 hours.
 - nflverse release files (play by play, weekly player stats, weekly rosters, PFR defensive stats) and the sportsdataverse college defense file, plus ESPN college team stats.
+- Pinnacle's public guest odds feed (`guest.api.arcadia.pinnacle.com/0.1/leagues/{889,880}/matchups` and `/markets/straight`, no key) as a second price source for the game lines. It is unofficial and undocumented, so it is optional: any failure leaves it out of the snapshot and nothing else changes.
+- Kalshi trades before kickoff (`/markets/trades`) for the tracked picks the site asks about, to report the kickoff close.
 
 Each run turns those responses into one compact JSON snapshot (format v1), gzips it, and sends it to a private site with a signed request. Nothing in this repository computes picks or prices.
 
@@ -28,9 +30,9 @@ Options:
 | Option | Meaning |
 |---|---|
 | `--cache-dir DIR` | daily data: fee info, nflverse files, depth charts (6 hours), college stats; default `.cache`, `''` for none |
-| `--state-dir DIR` | run-to-run state: `history.json` (DraftKings lines of the last 48 hours, for line moves), `closes/` (closing lines waiting for their day to end), nflverse check stamps. Without it every run is a first run. |
+| `--state-dir DIR` | run-to-run state: `history.json` (DraftKings lines of the last 48 hours, for line moves), `closes/` (closing lines waiting for their day to end), nflverse check stamps, `pinnacle.json` (the last Pinnacle pull, reused for 15 minutes), `clv-closes.json` (Kalshi kickoff closes waiting for their market to settle). Without it every run is a first run. |
 | `--closes-dir DIR` | where finished days of closing lines are copied (default `closes/` here) |
-| `--skip LIST` | skip optional parts: `props`, `teamTotals`, `injuries`, `nflverse`, `cfb` (`--skip-injuries` also works) |
+| `--skip LIST` | skip optional parts: `props`, `teamTotals`, `injuries`, `nflverse`, `cfb`, `pinnacle` (`--skip-injuries` also works) |
 | `--kalshi-gap-ms N` | minimum gap between Kalshi requests, default 250 (Kalshi answers HTTP 429 to bursts on `/markets`) |
 | `--save-inputs FILE.json.gz` | keep the raw fetched inputs; `node scripts/build-fixture.mjs FILE.json.gz out.json` rebuilds the same snapshot offline |
 | `--now ISO` | run as if the clock read this time (game window, `generatedAt`, line history, closes); for tests and fixture rebuilds. Request signatures and time budgets always use the real clock. |
@@ -42,9 +44,9 @@ Exit code is 1 when nothing usable came back, when the POST to the site fails, o
 
 A source is also marked down (`ok: false`, with the reason in its errors) when its data arrived but cannot be right: ESPN scoreboard events that cannot be read, a current regular season or postseason week with no games, at least 5 games (and half) of the previous run's upcoming games missing, Kalshi markets or prop rungs with no price at all, no Kalshi game matching any ESPN game, or an injuries feed with nobody on it while NFL games are in the window. The site shows those sources as down instead of an empty slate.
 
-Every run has time budgets, so a host that accepts a connection and then stalls cannot hold the job past its 4 minute timeout: 100 seconds for all fetching, plus a shorter budget for each optional part (team totals 30 s, injuries 45 s, props and college data 60 s, nflverse 75 s), all counted from the start of the run, and 30 seconds for the settle handshake. A spent budget stops that part's open requests, sends no new ones, and records `<part> time budget (N s) spent` in its errors; the snapshot is then built and posted with whatever arrived. DraftKings prop line requests use a 10 second timeout and no retry.
+Every run has time budgets, so a host that accepts a connection and then stalls cannot hold the job past its 4 minute timeout: 100 seconds for all fetching, plus a shorter budget for each optional part (Pinnacle 25 s, team totals 30 s, injuries 45 s, props and college data 60 s, nflverse 75 s), all counted from the start of the run, and 30 seconds for the settle handshake. A spent budget stops that part's open requests, sends no new ones, and records `<part> time budget (N s) spent` in its errors; the snapshot is then built and posted with whatever arrived. DraftKings prop line requests use a 10 second timeout and no retry.
 
-A normal 5 minute run sends about 35 requests: Kalshi core, team totals and props (about 25, paced), ESPN scoreboards (4), the injuries feed (1) and DraftKings prop lines (2 per NFL game inside 48 hours). Fee info, depth charts, nflverse and college data come from the cache; nflverse is checked with a HEAD request at most every 30 minutes and downloaded only when its ETag changes. A file that is missing upstream and has no cached copy (the new season's nflverse files from the March 1 rollover until September, or the new college season's file before late August) is asked for again only after 6 hours (30 minutes or 1 hour after other errors), with one HEAD request and no download; until then the source keeps reporting the error.
+A normal 5 minute run sends about 35 requests: Kalshi core, team totals and props (about 25, paced), ESPN scoreboards (4), the injuries feed (1) and DraftKings prop lines (2 per NFL game inside 48 hours). Every third run or so also pulls Pinnacle (4 requests, at most once per 15 minutes, since its CDN caches for 905 seconds anyway), and the settle step looks up at most 40 Kalshi kickoff closes per run (about 20 to 60 a week in all). Fee info, depth charts, nflverse and college data come from the cache; nflverse is checked with a HEAD request at most every 30 minutes and downloaded only when its ETag changes. A file that is missing upstream and has no cached copy (the new season's nflverse files from the March 1 rollover until September, or the new college season's file before late August) is asked for again only after 6 hours (30 minutes or 1 hour after other errors), with one HEAD request and no download; until then the source keeps reporting the error.
 
 ## Layout
 
@@ -62,11 +64,13 @@ lib/nflverse.mjs     NFL defense ratings (run, pass, front, secondary) and playe
 lib/cfb.mjs          college defense ratings and the weekly college QB check
 lib/csv.mjs          quote-aware CSV parser
 lib/moves.mjs        line history and line moves between runs
+lib/pinnacle.mjs     Pinnacle guest feed: pull every 15 minutes, trim, match to ESPN games, refs.pinnacle
+lib/clv.mjs          Kalshi kickoff close (VWAP of the last 200 pregame trades) for the settle handshake
 lib/closes.mjs       closing lines archive (state/closes, then closes/ once a day is over)
 lib/build.mjs        pure buildSnapshot(inputs, { now }) / buildRun used by the CLI and the tests
 lib/sources.mjs      all network fetching for one run
 lib/schema.mjs       snapshot shape checks
-lib/ingest.mjs       gzip, sha256, HMAC signature, POST, pending/settle handshake
+lib/ingest.mjs       gzip, sha256, HMAC signature, POST, pending/settle handshake (with kickoff closes)
 closes/              closing DraftKings lines by Eastern date (written by the workflow)
 scripts/             fixture tools (trim saved captures, build a snapshot from a raw capture folder)
 test/                node --test, offline fixtures only (no test touches the network)
@@ -97,3 +101,24 @@ The HMAC key is the UTF-8 bytes of the `INGEST_KEY` string exactly as stored; th
 - The DraftKings team total line is read as the middle of DraftKings' alternate team-total ladder and kept only when it is within 2 points of the total and spread's implied value.
 - College team labels use the school name (`shortName` is ESPN's `location`, for example "Western Kentucky").
 - The snapshot holds no ages relative to the run time; the same inputs always build the same snapshot.
+
+## Pinnacle prices (`games[i].refs.pinnacle`)
+
+Pulled at most once per 15 minutes (`state/pinnacle.json` keeps the last pull, failed or not, and runs in between reuse it). Pinnacle games are matched to ESPN games with the same matcher as Kalshi (Eastern date within a day, both teams), after a small name table for the schools Pinnacle names differently (Miami Florida, Mississippi, UL Lafayette, Sam Houston State, Hawaii, Miami Ohio, Middle Tennessee State), and only on a match score of 0.9 or more. Pinnacle games in the window that matched nothing are listed in `unmatched.pinnacle`. Only pregame games get a block, always in ESPN's home and away order:
+
+```js
+refs: { pinnacle: {
+  fetchedAt, lastModified,      // when the collector pulled the league; the CDN's Last-Modified of the prices (ISO)
+  offBoard,                     // true: Pinnacle lists the game without an open full game price (taken off the board)
+  odds: { ml: { home, away }, spread: { home, homeOdds, awayOdds }, total: { line, overOdds, underOdds } },   // American odds, null when absent
+  alts: [{ type: 'spread' | 'total', points, a, b }],   // alternate lines within 10 points of the main line
+                                                        // spread: points = home line, a = home, b = away; total: a = over, b = under
+  periods: { h1, q1 },          // NFL only, when priced: first half and first quarter, each { ml, spread, total, alts }
+} }
+```
+
+`sources.pinnacle` = `{ ok, fetchedAt, cached, requests, matched, matchedByLeague, errors }` (`matched` counts games with a block, off the board included). A failed league, a block (HTTP 403), a format change or a crash in the builder leaves the blocks out and sets `ok: false`; the rest of the snapshot is built exactly as without Pinnacle.
+
+## Kickoff closes (settle handshake)
+
+The site's pending list may hold `{ ticker, kickoff }` objects as well as plain ticker strings. For each listed ticker whose kickoff has passed, the settle step asks Kalshi for `/markets/trades?ticker=T&max_ts=<kickoff>&limit=200` (paced with the run's other Kalshi requests) and posts the count-weighted average yes price of those last 200 pregame trades as `closeYes` (dollars) next to `result`. At most 40 lookups per run, settled markets first; a close is kept in `state/clv-closes.json` once known, and a settled result whose close is still missing is not posted yet, so it comes back on a later run. A market with no pregame trades, a lookup Kalshi refuses (400 or 404), three failed lookups, or a kickoff more than 12 hours ago sends the result with `closeYes: null` instead of waiting longer. Plain ticker strings settle exactly as before, without `closeYes`.
