@@ -295,3 +295,23 @@ test('fetchPropInputs: games without DK-comparable Kalshi ladders are skipped (n
   assert.equal(r.stats.espnRequests, 0);
   assert.deepEqual(r.espnProps, {});
 });
+
+test('fetchPropInputs: a stalled ESPN core host costs one short timeout per game (no retry)', async () => {
+  const games = slateGames(4);
+  const up = mockUpstream({ games });
+  const fetchImpl = (url, init) => {
+    if (!new URL(url).hostname.includes('espn')) return up.fetchImpl(url, init);
+    return new Promise((_, rej) => {
+      const guard = setTimeout(() => rej(new Error('never aborted')), 60000); // ref'd, like an open socket
+      init.signal.addEventListener('abort', () => { clearTimeout(guard); rej(init.signal.reason); }, { once: true });
+    });
+  };
+  const t = Date.now();
+  const r = await fetchPropInputs({ games, fetchImpl, now: NOW, pauseMs: 0, espnTimeoutMs: 40 });
+  const ms = Date.now() - t;
+  assert.equal(r.stats.espnGames, 4);
+  assert.equal(r.stats.espnRequests, 4, 'one attempt per game: a stalled propBets request is not retried');
+  assert.equal(r.errors.filter((e) => /espn propBets \d+: .*timeout/.test(e)).length, 4, r.errors.join(' | '));
+  assert.ok(ms < 3000, `took ${ms} ms`);
+  assert.ok(Object.keys(r.kalshi).length > 0, 'Kalshi ladders kept');
+});

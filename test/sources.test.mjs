@@ -8,6 +8,8 @@ import { FIX, rd, CORE, RESEARCH_NOW } from './helpers.mjs';
 import { collectInputs } from '../lib/sources.mjs';
 import { pacedFetch } from '../lib/http.mjs';
 import { buildSnapshot } from '../lib/build.mjs';
+import { kalshiGameCode } from '../lib/glue.mjs';
+import { PROP_SERIES } from '../lib/props.mjs';
 import { validateSnapshot } from '../lib/schema.mjs';
 
 const F = 'research-20261011';
@@ -20,9 +22,34 @@ const NV = {
 };
 const OFF = { pauseMs: 0, parts: { props: false, teamTotals: false, injuries: false, nflverse: false, cfb: false } };
 
+// A host that accepts the request and never answers, until the request's signal aborts. The guard timer is ref'd,
+// like a real open socket, so a missing abort shows up as a slow test instead of an early exit.
+function hangUntilAborted(init) {
+  return new Promise((_, rej) => {
+    const sig = init?.signal;
+    const guard = setTimeout(() => rej(new Error('test: request was never aborted')), 60000);
+    const stop = () => { clearTimeout(guard); rej(sig.reason); };
+    if (sig?.aborted) stop(); else sig?.addEventListener('abort', stop, { once: true });
+  });
+}
+
+// One open DK-comparable prop ladder market per NFL fixture game, for every prop series (so ESPN propBets are wanted).
+const NFL_BOARD = rd(F, 'espn_nfl_w6.json');
+function propLadderMarkets(series) {
+  return NFL_BOARD.events.map((e) => {
+    const c = e.competitions[0].competitors;
+    const home = c.find((x) => x.homeAway === 'home').team.abbreviation;
+    const away = c.find((x) => x.homeAway === 'away').team.abbreviation;
+    const ev = `${series}-${kalshiGameCode(e.date, away, home)}`;
+    return { ticker: `${ev}-${home}PLAYER1-50`, event_ticker: ev, yes_sub_title: 'A Player: 50+', floor_strike: 49.5, status: 'active',
+      close_time: new Date(Date.parse(e.date) + 48 * 3600e3).toISOString(), yes_bid_dollars: '0.5000', yes_ask_dollars: '0.5200' };
+  });
+}
+
 // Serves the research capture (Kalshi core, ESPN boards) and the Phase B fixtures as if they were the live APIs.
 // Any URL it does not know is a test failure (calls.unknown), so nothing can reach the network.
-function fakeApis({ failSeries = [], leagueDown = false } = {}) {
+// hang(url) -> true: that request stalls until aborted. propLadders: Kalshi lists prop ladders for the NFL games.
+function fakeApis({ failSeries = [], leagueDown = false, hang = null, propLadders = false } = {}) {
   const calls = [];
   calls.unknown = [];
   const series = rd(F, 'series.json');
@@ -31,10 +58,12 @@ function fakeApis({ failSeries = [], leagueDown = false } = {}) {
     const method = init.method || 'GET';
     calls.push(method === 'HEAD' ? `HEAD ${url}` : url);
     const u = new URL(url);
+    if (hang?.(u)) return hangUntilAborted(init);
     if (u.hostname.includes('kalshi.com')) {
       if (u.pathname.endsWith('/markets')) {
         const s = u.searchParams.get('series_ticker');
         if (failSeries.includes(s)) return new Response('down', { status: 503 });
+        if (propLadders && PROP_SERIES[s]?.espnType) return ok({ cursor: '', markets: propLadderMarkets(s) });
         return ok({ cursor: '', markets: CORE.includes(s) ? rd(F, `kalshi_${s}.json`).markets : [] });
       }
       const m = /\/series\/([A-Z]+)$/.exec(u.pathname);
@@ -242,4 +271,71 @@ test('collectInputs: one series down on both hosts is recorded, the rest is kept
   assert.equal(s.sources.kalshi.ok, false);
   assert.equal(s.games.length, 76);
   assert.deepEqual(validateSnapshot(s), []);
+});
+
+// ---------------------------------------------------------------- time budgets (a stalled host must not hold the run)
+
+test('collectInputs: a stalled ESPN core host costs only the props budget; Kalshi core and the boards are kept', async () => {
+  const now = Date.parse('2026-10-17T18:00:00Z'); // Saturday: the Sunday and Monday NFL games are inside the 48 h props horizon
+  const f = fakeApis({ propLadders: true, hang: (u) => u.hostname === 'sports.core.api.espn.com' });
+  const t = Date.now();
+  const inputs = await collectInputs({ now, fetchImpl: f, budgets: { props: 300 }, pauseMs: 0, parts: { teamTotals: false, injuries: false, nflverse: false, cfb: false } });
+  const ms = Date.now() - t;
+  assert.ok(ms < 5000, `took ${ms} ms`);
+  assert.deepEqual(f.calls.unknown, []);
+  assert.deepEqual(inputs.stats.budgetsSpent, ['props']);
+  assert.ok(inputs.props.stats.espnGames >= 4, 'ESPN propBets were wanted');
+  assert.ok(inputs.props.errors.some((e) => /props time budget \(300 ms\) spent/.test(e)), inputs.props.errors.join(' | '));
+  assert.ok(inputs.props.stats.espnRequests <= inputs.props.stats.espnGames, 'no retries once the budget is spent; refused requests are not counted');
+  assert.ok(Object.keys(inputs.props.kalshi).length > 0, 'Kalshi prop ladders fetched before the stall are kept');
+  assert.deepEqual(inputs.kalshi.errors, []);
+  assert.equal(reqs(inputs).kalshi, 6);
+  const snap = buildSnapshot(inputs, { now });
+  assert.deepEqual(validateSnapshot(snap), []);
+  assert.equal(snap.sources.kalshi.ok, true);
+  assert.equal(snap.sources.espnOdds.ok, true);
+  assert.equal(snap.sources.props.ok, false);
+  assert.ok(snap.games.some((g) => g.kalshi.markets.length), 'core prices are in the snapshot');
+});
+
+test('collectInputs: stalled GitHub hosts cost only the nflverse and cfb budgets', async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'gd-cache-'));
+  try {
+    const now = Date.parse(RESEARCH_NOW);
+    const f = fakeApis({ hang: (u) => u.hostname === 'github.com' });
+    const t = Date.now();
+    const inputs = await collectInputs({ now, fetchImpl: f, cacheDir, budgets: { nflverse: 250, cfb: 250 }, pauseMs: 0, parts: { props: false, teamTotals: false, injuries: false } });
+    const ms = Date.now() - t;
+    assert.ok(ms < 5000, `took ${ms} ms`);
+    assert.deepEqual([...inputs.stats.budgetsSpent].sort(), ['cfb', 'nflverse']);
+    assert.ok(inputs.nflverse.errors.length >= 1 && inputs.nflverse.errors.every((e) => /nflverse time budget \(250 ms\) spent/.test(e)), inputs.nflverse.errors.join(' | '));
+    assert.ok(inputs.cfb.errors.some((e) => /cfb dvp: .*cfb time budget \(250 ms\) spent/.test(e)), inputs.cfb.errors.join(' | '));
+    const snap = buildSnapshot(inputs, { now });
+    assert.equal(snap.sources.kalshi.ok, true);
+    assert.equal(snap.sources.nflverse.ok, false);
+    assert.equal(snap.games.length, 76);
+  } finally {
+    rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test('collectInputs: the run budget stops every request, core included, without retries, and the run still returns', async () => {
+  const now = Date.parse(RESEARCH_NOW);
+  const f = fakeApis({ hang: () => true });
+  const t = Date.now();
+  const inputs = await collectInputs({ now, fetchImpl: f, budgets: { run: 300 }, pauseMs: 0 });
+  const ms = Date.now() - t;
+  assert.ok(ms < 5000, `took ${ms} ms`);
+  assert.ok(inputs.stats.budgetsSpent.includes('run'));
+  // the requests in flight are cut (2 core series, mapLimit 2; the NFL board, the leagues go one after the other); no
+  // retry, no fallback host, and nothing is sent after the deadline (4 series and the CFB board are refused unsent)
+  assert.equal(reqs(inputs).kalshi, 2);
+  assert.equal(inputs.kalshi.errors.length, 6);
+  assert.equal(reqs(inputs).espn, 1);
+  assert.ok(inputs.kalshi.errors.every((e) => /run time budget \(300 ms\) spent/.test(e)), inputs.kalshi.errors.join(' | '));
+  assert.equal(inputs.espn.errors.length, 2);
+  const snap = buildSnapshot(inputs, { now });
+  assert.deepEqual(validateSnapshot(snap), []);
+  assert.equal(snap.sources.kalshi.ok, false);
+  assert.equal(snap.sources.espnOdds.ok, false);
 });

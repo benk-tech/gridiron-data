@@ -191,3 +191,28 @@ test('neutral-site flip maps Kalshi teams onto ESPN home/away', () => {
   for (const m of g.kalshi.markets.filter((x) => x.type === 'spread')) assert.equal(m.team, /-HOU\d+$/.test(m.ticker) ? 'home' : 'away');
   assert.deepEqual(validateSnapshot(s), []);
 });
+
+test('a builder that throws costs only its own source (build failed, ok=false); the games and prices are still built', () => {
+  const boom = (what) => { throw new Error(`boom ${what}`); };
+  const inp = researchInputs();
+  inp.props = { fetchedAt: RESEARCH_NOW, requests: 1, errors: [], espnProps: {}, kalshi: { get KXNFLRSHYDS() { return boom('props'); } } };
+  inp.nflverse = { season: 2026, fetchedAt: RESEARCH_NOW, errors: [], get pbp() { return boom('nflverse'); } };
+  inp.cfb = { season: 2026, errors: [], requests: 0, defense: { fetchedAt: RESEARCH_NOW, get dvp() { return boom('cfb'); } }, qb: null };
+  inp.history = { v: 1, at: '2026-10-11T22:46:00Z', get games() { return boom('history'); }, props: {} };
+  inp.teamTotals = { fetchedAt: RESEARCH_NOW, requests: 2, errors: [], kalshi: { get KXNFLTEAMTOTAL() { return boom('teamTotals'); } } };
+  inp.injuryFeed = { leagueFetchedAt: RESEARCH_NOW, errors: [], requests: 1, depth: {}, schedule: [], league: { count: 1, get items() { return boom('injuries'); } } };
+  const base = buildSnapshot(researchInputs(), { now: RESEARCH_NOW });
+  let s;
+  assert.doesNotThrow(() => { s = buildSnapshot(inp, { now: RESEARCH_NOW }); });
+  assert.deepEqual(validateSnapshot(s), []);
+  for (const [k, what] of [['props', 'props'], ['nflverse', 'nflverse'], ['cfb', 'cfb'], ['moves', 'history'], ['teamTotals', 'teamTotals'], ['injuries', 'injuries']]) {
+    assert.equal(s.sources[k].ok, false, k);
+    assert.ok(s.sources[k].errors.some((e) => e === `build failed: boom ${what}`), `${k}: ${s.sources[k].errors.join(' | ')}`);
+  }
+  assert.deepEqual(s.props, []);
+  assert.ok(s.games.every((g) => Array.isArray(g.moves) && g.moves.length === 0));
+  assert.equal(s.sources.kalshi.ok, true);
+  assert.equal(s.sources.espnOdds.ok, true);
+  assert.equal(s.games.length, 76);
+  assert.deepEqual(s.games.map((g) => g.kalshi.markets), base.games.map((g) => g.kalshi.markets), 'core markets untouched');
+});

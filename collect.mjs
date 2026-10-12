@@ -35,11 +35,13 @@ import { buildRun, summarize } from './lib/build.mjs';
 import { validateSnapshot } from './lib/schema.mjs';
 import { packSnapshot, postSnapshot, settleHandshake } from './lib/ingest.mjs';
 import { CORE_SERIES_LIST, createKalshiClient } from './lib/kalshi.mjs';
-import { createHttp, errorText } from './lib/http.mjs';
+import { createHttp, errorText, withDeadline, budgetSignal } from './lib/http.mjs';
 import { readHistoryFile, writeHistoryFile } from './lib/moves.mjs';
 import { writeClosesFile, syncClosesDir } from './lib/closes.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+// The settle handshake (after the POST) gets its own budget so it can never hold the job past its timeout either.
+const SETTLE_BUDGET_MS = 30e3;
 
 function version() {
   if (process.env.GITHUB_SHA) return process.env.GITHUB_SHA.slice(0, 12);
@@ -132,6 +134,7 @@ async function main() {
     log(`snapshot ${snapshot.generatedAt}  ${(pack.rawBytes / 1024).toFixed(0)} KB raw, ${(pack.gzBytes / 1024).toFixed(0)} KB gzip; fetch ${fetchMs} ms, build ${buildMs} ms`);
     log(`requests: ${inputs.stats.totalRequests} total (kalshi ${inputs.stats.kalshiRequests}, espn ${inputs.stats.espnRequests})`);
     for (const [name, s] of Object.entries(inputs.stats.bySource || {})) log(`  ${name.padEnd(10)} ${String(s.requests).padStart(3)} req ${String(s.ms).padStart(6)} ms`);
+    if (inputs.stats.budgetsSpent?.length) console.warn(`time budget spent: ${inputs.stats.budgetsSpent.join(', ')} (requests still open were stopped; building with what arrived)`);
     for (const [lg, b] of Object.entries(sum.byLeague)) log(`${lg}: ${b.games} games (${b.pre || 0} pre, ${b.in || 0} in), ${b.withKalshi} on Kalshi, ${b.withOdds} with DK odds, ${b.markets} markets`);
     const mt = sum.marketsByType;
     log(`markets: ${sum.markets} (game ${mt.game}, spread ${mt.spread}, total ${mt.total}, team total ${mt.teamTotal}); ladders on ${sum.withLadders} games, team totals on ${sum.withTeamTotals}, DK team totals on ${sum.dkTeamTotals}; combo eligible ${sum.comboEligible}; unmatched kalshi ${sum.unmatchedKalshi}, espn ${sum.unmatchedEspn}`);
@@ -153,7 +156,7 @@ async function main() {
       try {
         const w = await writeClosesFile(join(stateDir, 'closes'), run.closes, { now: t0 });
         if (w.added) log(`closes: staged ${w.added} game(s) in ${w.files.length} day file(s)`);
-        await writeHistoryFile(historyPath, run.history);
+        if (run.history) await writeHistoryFile(historyPath, run.history); // null: the move builder failed, keep the old file
         const sy = await syncClosesDir(join(stateDir, 'closes'), closesDir, { now: t0 });
         if (sy.changed.length) log(`closes: ${sy.changed.length} finished day file(s) copied to the archive`);
       } catch (e) {
@@ -184,12 +187,16 @@ async function main() {
   }
 
   if (args.settle) {
+    const budget = budgetSignal(SETTLE_BUDGET_MS, 'settle');
     try {
-      const kalshi = createKalshiClient({ http: createHttp({ retries: 0 }) });
-      await settleHandshake({ url: ingest.url, key: ingest.key, kalshi, log });
+      const fetchImpl = withDeadline(globalThis.fetch, budget.signal);
+      const kalshi = createKalshiClient({ http: createHttp({ fetchImpl, retries: 0 }) });
+      await settleHandshake({ url: ingest.url, key: ingest.key, kalshi, fetchImpl, log });
     } catch (e) {
       // A failed settle is retried on the next run; it does not fail the job.
       console.warn(`settle skipped: ${errorText(e)}`);
+    } finally {
+      budget.clear();
     }
   }
   return exit;
