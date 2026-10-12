@@ -30,7 +30,7 @@ Options:
 | Option | Meaning |
 |---|---|
 | `--cache-dir DIR` | daily data: fee info, nflverse files, depth charts (6 hours), college stats; default `.cache`, `''` for none |
-| `--state-dir DIR` | run-to-run state: `history.json` (DraftKings lines of the last 48 hours, for line moves), `closes/` (closing lines waiting for their day to end), nflverse check stamps, `pinnacle.json` (the last Pinnacle pull, reused for 15 minutes), `clv-closes.json` (Kalshi kickoff closes waiting for their market to settle). Without it every run is a first run. |
+| `--state-dir DIR` | run-to-run state: `history.json` (DraftKings lines and Kalshi implied centers of the last 48 hours, for line moves), `closes/` (closing lines waiting for their day to end), nflverse check stamps, `pinnacle.json` (the last Pinnacle pull, reused for 15 minutes), `clv-closes.json` (Kalshi kickoff closes waiting for their market to settle). Without it every run is a first run. |
 | `--closes-dir DIR` | where finished days of closing lines are copied (default `closes/` here) |
 | `--skip LIST` | skip optional parts: `props`, `teamTotals`, `injuries`, `nflverse`, `cfb`, `pinnacle` (`--skip-injuries` also works) |
 | `--kalshi-gap-ms N` | minimum gap between Kalshi requests, default 250 (Kalshi answers HTTP 429 to bursts on `/markets`) |
@@ -63,7 +63,7 @@ lib/injuries.mjs     NFL injuries graded per game from the league feed and depth
 lib/nflverse.mjs     NFL defense ratings (run, pass, front, secondary) and player stats from nflverse
 lib/cfb.mjs          college defense ratings and the weekly college QB check
 lib/csv.mjs          quote-aware CSV parser
-lib/moves.mjs        line history and line moves between runs
+lib/moves.mjs        line history (DraftKings lines, Kalshi implied centers) and moves between runs
 lib/pinnacle.mjs     Pinnacle guest feed: pull every 15 minutes, trim, match to ESPN games, refs.pinnacle
 lib/clv.mjs          Kalshi kickoff close (VWAP of the last 200 pregame trades) for the settle handshake
 lib/closes.mjs       closing lines archive (state/closes, then closes/ once a day is over)
@@ -101,6 +101,22 @@ The HMAC key is the UTF-8 bytes of the `INGEST_KEY` string exactly as stored; th
 - The DraftKings team total line is read as the middle of DraftKings' alternate team-total ladder and kept only when it is within 2 points of the total and spread's implied value.
 - College team labels use the school name (`shortName` is ESPN's `location`, for example "Western Kentucky").
 - The snapshot holds no ages relative to the run time; the same inputs always build the same snapshot.
+
+## Kalshi line history (`games[i].kalshiMoves`)
+
+Every run also records where Kalshi's own markets put each pregame game, next to the DraftKings lines in `state/history.json`, so the site can see how long Kalshi takes to follow a DraftKings move. It uses only the markets already in the snapshot (no extra requests) and the same method as the site engine (`angles.js kalshiCenters`): a market counts only when it is active and its YES ask minus YES bid is at most 10 cents, and its price is the middle of the two.
+
+- `ml`: the home team's win chance, the middle price of the home GAME market (or 1 minus the away one), 3 decimals. The DraftKings `ml` move is the same number with the vig removed.
+- `spread`: the home line where the spread ladder crosses 50% (home rungs at their strike, away rungs flipped), straight line between neighboring rungs, 1 decimal. Negative means the home team is favored, the same sign as `odds.spread.home`.
+- `total`: the total where the total ladder crosses 50%, 1 decimal.
+
+Prices in the middle of a quote wiggle from run to run without any trading, so a new point is kept only when the value has moved at least 1 cent (`ml`) or more than a quarter point (`spread`, `total`, so 0.3 or more on the 0.1 grid) from the last kept point. A market that cannot give a value in a run (quote too wide, ladder pulled, no 50% crossing) adds nothing, and the next real change still starts from the last kept value. Nothing is recorded after kickoff. Points older than 48 hours are dropped like the DraftKings lines, keeping the newest older one as the starting point.
+
+```js
+kalshiMoves: [{ market: 'ml' | 'spread' | 'total', from, to, at }]   // every game has the array (empty when nothing moved); at = collector time
+```
+
+Same shape and order as `games[i].moves` (oldest first, then ml, spread, total). The snapshot carries at most the newest 20 moves per market per game; the history keeps up to 200 points per market. `sources.moves.kalshiGames` counts the games with Kalshi points on record. A history file from before this change loads as is and starts its Kalshi points on the next run.
 
 ## Pinnacle prices (`games[i].refs.pinnacle`)
 

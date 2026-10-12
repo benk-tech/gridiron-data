@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const clone = (x) => JSON.parse(JSON.stringify(x));
+const NO_MOVES = { games: {}, props: {}, kalshi: {} };
 const T0 = Date.parse('2026-10-11T18:00:00Z');
 const MIN = 60e3, HOUR = 3600e3;
 const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -35,7 +36,7 @@ test('helpers: americanToProb, gameLineValues, propKey', () => {
 
 test('first run: history seeded, no moves; timestamps are the collector clock', () => {
   const { history, moves } = updateHistory(null, historyInput([game()], [prop(86.5)]), { now: T0 });
-  assert.deepEqual(moves, { games: {}, props: {} });
+  assert.deepEqual(moves, NO_MOVES);
   assert.equal(history.v, HISTORY_VERSION);
   assert.equal(history.at, '2026-10-11T18:00:00Z');
   const g = history.games['nfl-401872993'];
@@ -74,7 +75,7 @@ test('48 h window: old moves drop out, the newest old point stays as the baselin
   h = updateHistory(h, historyInput([game({ spread: -3.5 })], [prop(80.5)]), { now: T0 + HOUR }).history;
   // 50 h later: still the same values; the move at T0+1h is now outside the window
   let r = updateHistory(h, historyInput([game({ spread: -3.5 })], [prop(80.5)]), { now: T0 + 51 * HOUR });
-  assert.deepEqual(r.moves, { games: {}, props: {} });
+  assert.deepEqual(r.moves, NO_MOVES);
   assert.deepEqual(r.history.games['nfl-401872993'].lines.spread, [[iso(T0 + HOUR), -3.5]], 'baseline kept');
   // a later change moves from the baseline value
   r = updateHistory(r.history, historyInput([game({ spread: -4 })], [prop(80.5)]), { now: T0 + 52 * HOUR });
@@ -95,7 +96,7 @@ test('in-game: lines stop recording at kickoff, last pregame values kept for the
   assert.deepEqual(g.lines.spread, [[iso(T0), -3]]);
   assert.equal(g.pre.odds.spread.home, -3);
   assert.equal(r.history.props['nfl-401872993|rushYds|3043078'].dk.line, 80.5);
-  assert.deepEqual(r.moves, { games: {}, props: {} });
+  assert.deepEqual(r.moves, NO_MOVES);
   // a pregame game that vanished from the snapshot after kickoff is marked started (closes fire once)
   h = updateHistory(null, historyInput([game()], []), { now: T0 }).history;
   const gone = updateHistory(h, { games: [], props: [] }, { now: Date.parse('2026-10-12T00:30:00Z') }).history;
@@ -129,7 +130,7 @@ test('applyMoves attaches arrays to every game and prop; historyInput skips prop
 test('bad or foreign history files start fresh; history round-trips through the file helpers', async () => {
   for (const bad of [{ v: 99, games: {} }, 'nope', { v: 1, games: { x: null, y: { lines: { spread: [['not a date', 1], [iso(T0), 'x']] } } } }]) {
     const r = updateHistory(bad, historyInput([game()], []), { now: T0 });
-    assert.deepEqual(r.moves, { games: {}, props: {} });
+    assert.deepEqual(r.moves, NO_MOVES);
     assert.ok(r.history.games['nfl-401872993']);
   }
   const dir = await mkdtemp(join(tmpdir(), 'gd-hist-'));
