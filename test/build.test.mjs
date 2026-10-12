@@ -1,0 +1,181 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { researchInputs, balatlInputs, RESEARCH_NOW, BALATL_NOW } from './helpers.mjs';
+import { buildSnapshot, summarize, WINDOW } from '../lib/build.mjs';
+import { validateSnapshot } from '../lib/schema.mjs';
+import { teamScore } from '../lib/match.mjs';
+import { packSnapshot } from '../lib/ingest.mjs';
+
+test('research capture -> valid snapshot v1 with 14 NFL + 62 FBS games, all matched', () => {
+  const s = buildSnapshot(researchInputs(), { now: RESEARCH_NOW, version: 'test', runMs: 1234 });
+  assert.deepEqual(validateSnapshot(s), []);
+  assert.equal(s.v, 1);
+  assert.equal(s.generatedAt, '2026-10-11T22:51:00Z');
+  assert.deepEqual(s.collector, { version: 'test', runMs: 1234 });
+  const sum = summarize(s);
+  assert.equal(sum.byLeague.nfl.games, 14);
+  assert.equal(sum.byLeague.cfb.games, 62);
+  assert.equal(sum.byLeague.nfl.withKalshi, 14);
+  assert.equal(sum.byLeague.cfb.withKalshi, 62);
+  assert.equal(sum.byLeague.nfl.withOdds, 13, 'WSH @ SF had no DK line');
+  assert.equal(sum.byLeague.cfb.withOdds, 58);
+  assert.deepEqual(s.unmatched.espn, []);
+  // Unmatched Kalshi: FCS games plus Kalshi games of weeks this capture had no ESPN board for. Never an FBS week-7 game.
+  assert.ok(s.unmatched.kalshi.length >= 54);
+  for (const k of ['sources', 'fees', 'games', 'props', 'defense', 'players', 'comboEligible', 'unmatched']) assert.ok(k in s, k);
+  assert.ok(s.sources.kalshi.ok && s.sources.espnOdds.ok && s.sources.combos.ok && s.sources.fees.ok);
+  assert.equal(s.sources.combos.collection, 'KXMVECROSSCATEGORY-R');
+  assert.deepEqual(s.fees.KXNFLSPREAD, { feeType: 'quadratic_with_maker_fees', multiplier: 1 });
+  // Phase B placeholders.
+  assert.deepEqual(s.props, []);
+  assert.deepEqual(s.defense, { nfl: {}, cfb: {} });
+  assert.deepEqual(s.players, {});
+  for (const k of ['props', 'nflverse']) { assert.equal(s.sources[k].ok, false); assert.deepEqual(s.sources[k].errors, ['not implemented yet']); }
+  assert.equal(s.sources.injuries.ok, false);
+  assert.deepEqual(s.sources.injuries.errors, ['pending phase B']);
+});
+
+test('every spread market in the snapshot is on the right team (checked against ESPN names)', () => {
+  const s = buildSnapshot(researchInputs(), { now: RESEARCH_NOW });
+  let spreads = 0;
+  for (const g of s.games) {
+    for (const m of g.kalshi.markets) {
+      if (m.type === 'total') { assert.equal(m.team, null); continue; }
+      const team = g[m.team];
+      const code = m.ticker.slice(m.event.length + 1).replace(/\d+$/, '');
+      assert.equal(code, team.kalshiCode, `${m.ticker} code vs ${m.team}`);
+      if (m.type === 'spread') {
+        spreads++;
+        const name = m.title.replace(/ wins by over .*$/, '');
+        const espnTeam = { abbreviation: team.abbr, displayName: team.name, shortDisplayName: team.shortName, location: team.name };
+        const other = g[m.team === 'home' ? 'away' : 'home'];
+        const otherTeam = { abbreviation: other.abbr, displayName: other.name, shortDisplayName: other.shortName, location: other.name };
+        const lg = g.league;
+        assert.ok(teamScore({ code, name }, espnTeam, lg) >= teamScore({ code, name }, otherTeam, lg), `${m.ticker}: '${name}' closer to ${other.name} than ${team.name}`);
+        assert.equal(m.event, g.kalshi.spreadEvent);
+      }
+    }
+  }
+  assert.ok(spreads > 1500, `spreads ${spreads}`);
+});
+
+test('combo eligibility is limited to events in the snapshot', () => {
+  const s = buildSnapshot(researchInputs(), { now: RESEARCH_NOW });
+  const events = new Set(s.games.flatMap((g) => [g.kalshi.gameEvent, g.kalshi.spreadEvent, g.kalshi.totalEvent]).filter(Boolean));
+  assert.ok(s.comboEligible.length > 100);
+  for (const e of s.comboEligible) assert.ok(events.has(e), e);
+  assert.ok(s.comboEligible.includes('KXNFLSPREAD-26OCT15SEADEN'));
+  assert.ok(!s.comboEligible.some((e) => e.startsWith('KXNFLSPREAD-26OCT18LACKC')), 'week 6 NFL ladders were mostly not eligible');
+});
+
+test('window: drops post games, keeps pre/in within -6 h .. +9 d', () => {
+  const later = Date.parse(RESEARCH_NOW) + 5 * 86400e3; // Oct 16 22:51Z: early week-7 CFB and Thursday NFL games fall out
+  const s = buildSnapshot(researchInputs(), { now: later });
+  for (const g of s.games) {
+    const k = Date.parse(g.kickoff);
+    assert.ok(k >= later - WINDOW.behindMs && k <= later + WINDOW.aheadMs, g.id);
+  }
+  assert.ok(s.games.length < 76);
+  // A game marked 'post' is never kept even when its kickoff is in the window.
+  const inp = researchInputs();
+  const ev = inp.espn.scoreboards.nfl[0].events[0];
+  ev.status = { type: { state: 'post' } };
+  const s2 = buildSnapshot(inp, { now: RESEARCH_NOW });
+  assert.ok(!s2.games.some((g) => g.espnId === ev.id));
+  assert.ok(!s2.unmatched.espn.includes(ev.id));
+});
+
+test('BAL @ ATL capture (2026-10-11T23:49Z)', () => {
+  const s = buildSnapshot(balatlInputs(), { now: BALATL_NOW, version: 'fixture', leagues: ['nfl'] });
+  assert.deepEqual(validateSnapshot(s), []);
+  const g = s.games.find((x) => x.id === 'nfl-401872993');
+  assert.ok(g);
+  assert.equal(g.kickoff, '2026-10-12T00:20:00Z');
+  assert.equal(g.state, 'pre');
+  assert.equal(g.home.abbr, 'ATL');
+  assert.equal(g.home.kalshiCode, 'ATL');
+  assert.equal(g.away.kalshiCode, 'BAL');
+  assert.equal(g.kalshi.gameEvent, 'KXNFLGAME-26OCT11BALATL');
+  assert.equal(g.kalshi.spreadEvent, 'KXNFLSPREAD-26OCT11BALATL');
+  assert.equal(g.kalshi.totalEvent, 'KXNFLTOTAL-26OCT11BALATL');
+  assert.equal(g.kalshi.markets.filter((m) => m.type === 'game').length, 2);
+  assert.equal(g.kalshi.markets.filter((m) => m.type === 'spread').length, 25);
+  assert.equal(g.kalshi.markets.filter((m) => m.type === 'total').length, 19);
+  const atl = g.kalshi.markets.find((m) => m.ticker === 'KXNFLGAME-26OCT11BALATL-ATL');
+  assert.equal(atl.team, 'home');
+  assert.equal(atl.yesAsk, 0.63);
+  assert.equal(atl.yesBid, 0.62);
+  const bal6 = g.kalshi.markets.find((m) => m.ticker === 'KXNFLSPREAD-26OCT11BALATL-BAL6');
+  assert.equal(bal6.team, 'away');
+  assert.equal(bal6.strike, 5.5);
+  for (const m of g.kalshi.markets.filter((x) => x.type === 'spread')) {
+    assert.equal(m.team, m.ticker.includes('-ATL') ? 'home' : 'away', m.ticker);
+  }
+  assert.deepEqual(g.odds.ml, { home: -175, away: 145, homeOpen: 180, awayOpen: -218 });
+  assert.equal(g.odds.spread.home, -3);
+  assert.equal(g.injuries.away.find((x) => x.name === 'Lamar Jackson').status, 'Out');
+  assert.equal(g.injuries.home.length, 5);
+  // BUF @ LAR (MNF) is in the window but the capture has no Kalshi events for it.
+  const mnf = s.games.find((x) => x.id === 'nfl-401872994');
+  assert.ok(mnf);
+  assert.equal(mnf.kalshi.gameEvent, null);
+  assert.deepEqual(mnf.kalshi.markets, []);
+  assert.deepEqual(s.unmatched.espn, ['401872994']);
+  assert.equal(s.games.length, 2, 'post games dropped');
+  // Offline fixture: fees are defaults and flagged; the MNF summary was not captured.
+  assert.deepEqual(s.fees.KXNFLGAME, { feeType: 'quadratic_with_maker_fees', multiplier: 1, assumed: true });
+  assert.equal(s.sources.fees.ok, false);
+  assert.equal(s.sources.espnOdds.ok, true, 'NFL-only snapshot does not expect a CFB board');
+  assert.equal(s.sources.kalshi.ok, true);
+  assert.ok(!('KXNCAAFGAME' in s.fees));
+  assert.match(s.sources.injuries.errors.join(' '), /401872994/);
+  assert.equal(s.sources.combos.ok, false);
+  assert.deepEqual(s.comboEligible, []);
+});
+
+test('empty and partial inputs never throw and degrade to ok=false', () => {
+  const s = buildSnapshot({}, { now: RESEARCH_NOW });
+  assert.deepEqual(validateSnapshot(s), []);
+  assert.deepEqual(s.games, []);
+  for (const k of ['kalshi', 'espnOdds', 'injuries', 'props', 'nflverse', 'combos', 'fees']) assert.equal(s.sources[k].ok, false, k);
+  // Kalshi down, ESPN up: games still listed with null Kalshi data.
+  const inp = researchInputs();
+  inp.kalshi = { fetchedAt: RESEARCH_NOW, requests: 2, errors: ['KXNFLGAME: HTTP 503'], markets: {} };
+  const s2 = buildSnapshot(inp, { now: RESEARCH_NOW });
+  assert.deepEqual(validateSnapshot(s2), []);
+  assert.equal(s2.games.length, 76);
+  assert.ok(s2.games.every((g) => g.kalshi.gameEvent === null));
+  assert.equal(s2.sources.kalshi.ok, false);
+  assert.match(s2.sources.kalshi.errors.join(' '), /HTTP 503/);
+  // One CFB series missing: NFL is untouched, CFB games keep their GAME markets.
+  const inp3 = researchInputs();
+  delete inp3.kalshi.markets.KXNCAAFTOTAL;
+  const s3 = buildSnapshot(inp3, { now: RESEARCH_NOW });
+  assert.equal(s3.sources.kalshi.ok, false);
+  assert.ok(s3.games.filter((g) => g.league === 'cfb').every((g) => g.kalshi.totalEvent === null));
+  assert.ok(s3.games.some((g) => g.league === 'nfl' && g.kalshi.totalEvent));
+});
+
+test('deterministic and within the size target', () => {
+  const a = JSON.stringify(buildSnapshot(researchInputs(), { now: RESEARCH_NOW }));
+  const b = JSON.stringify(buildSnapshot(researchInputs(), { now: RESEARCH_NOW }));
+  assert.equal(a, b);
+  const p = packSnapshot(JSON.parse(a));
+  assert.ok(p.gzBytes < 1.5 * 1024 * 1024, `gzip ${p.gzBytes}`);
+});
+
+test('neutral-site flip maps Kalshi teams onto ESPN home/away', () => {
+  const inp = researchInputs();
+  // Swap ESPN home/away for HOU vs JAX (the London game) and expect the market sides to follow ESPN.
+  const ev = inp.espn.scoreboards.nfl[0].events.find((e) => /HOU/.test(e.shortName) && /JAX/.test(e.shortName));
+  for (const c of ev.competitions[0].competitors) c.homeAway = c.homeAway === 'home' ? 'away' : 'home';
+  const s = buildSnapshot(inp, { now: RESEARCH_NOW });
+  const g = s.games.find((x) => x.espnId === ev.id);
+  assert.equal(g.home.abbr, 'HOU');
+  assert.equal(g.home.kalshiCode, 'HOU');
+  assert.equal(g.away.kalshiCode, 'JAC');
+  const houWin = g.kalshi.markets.find((m) => m.type === 'game' && m.ticker.endsWith('-HOU'));
+  assert.equal(houWin.team, 'home');
+  for (const m of g.kalshi.markets.filter((x) => x.type === 'spread')) assert.equal(m.team, /-HOU\d+$/.test(m.ticker) ? 'home' : 'away');
+  assert.deepEqual(validateSnapshot(s), []);
+});

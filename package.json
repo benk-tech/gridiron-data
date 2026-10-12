@@ -1,0 +1,12 @@
+{
+  "name": "gridiron-data",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Scheduled collector for public NFL and college football market and odds data.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "collect": "node collect.mjs --out snapshot.json",
+    "test": "node --test test/*.test.mjs"
+  }
+}
