@@ -137,7 +137,7 @@ test('ESPN answering 200 with empty scoreboards right after a full run: not post
     assert.equal(readFileSync(histPath, 'utf8'), hist1, 'state not saved, so the next run still compares with the good run');
 
     // more than 6 hours after the last good run the hold lapses: the empty snapshot is posted, with ESPN flagged down
-    await new Promise((r) => setTimeout(r, 1100)); // the site rejects a POST timestamp (seconds) that is not newer
+    site.state.lastTs = 0; // replay protection has its own tests; two posts can share a second here
     const later = await run([...common, '--now', '2026-10-12T04:56:00Z'], { ...env, FAKE_UPSTREAM: 'espn-empty' });
     assert.equal(later.code, 0, later.out);
     assert.equal(site.state.snapshots.length, 2);
