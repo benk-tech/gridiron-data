@@ -141,8 +141,12 @@ test('fees, collections, settle rows', () => {
   assert.equal(c.collection_ticker, 'KXMVECROSSCATEGORY-R');
   assert.ok(collectionEventTickers(c).includes('KXNFLSPREAD-26OCT15SEADEN'));
   assert.equal(pickCollection([]), null);
-  assert.deepEqual(settleRow({ ticker: 'A', status: 'finalized', result: 'yes', settlement_ts: '2026-10-12T03:31:07.123Z' }), { ticker: 'A', status: 'finalized', result: 'yes', settledAt: '2026-10-12T03:31:07Z' });
+  // Shape seen live on KXNFLGAME-26OCT11SFSEA-SF (2026-10-12).
+  assert.deepEqual(settleRow({ ticker: 'A', status: 'finalized', result: 'yes', settlement_ts: '2026-10-12T03:31:07.123Z', settlement_value_dollars: '1.0000' }), { ticker: 'A', status: 'finalized', result: 'yes', settledAt: '2026-10-12T03:31:07Z', value: 1 });
   assert.equal(settleRow({ ticker: 'A', status: 'active', result: '' }), null);
+  assert.equal(settleRow({ ticker: 'A', status: 'closed', result: '' }), null);
+  // Tie or void: final with no yes/no result -> reported with result '' and the settlement value.
+  assert.deepEqual(settleRow({ ticker: 'T', status: 'finalized', result: 'scalar', settlement_ts: '2026-10-12T03:31:07Z', settlement_value_dollars: '0.5000' }), { ticker: 'T', status: 'finalized', result: '', settledAt: '2026-10-12T03:31:07Z', value: 0.5 });
 });
 
 // ---- fetching with a mock fetch (offline)

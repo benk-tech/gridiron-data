@@ -5,7 +5,8 @@
 //   node collect.mjs --post                   fetch, build, gzip + sign + POST to $INGEST_URL/api/ingest
 //   node collect.mjs --settle                 pending/settle handshake only (or together with --post)
 //
-// Options: --cache-dir DIR (daily cache, default .cache), --skip-injuries, --quiet
+// Options: --cache-dir DIR (daily cache, default .cache), --skip-injuries, --quiet,
+//          --save-inputs FILE.json.gz (raw fetched inputs, rebuild offline with scripts/build-fixture.mjs)
 // Env (only for --post / --settle): INGEST_URL, INGEST_KEY. Neither is ever printed.
 //
 // Exit code: 1 when the Kalshi core series AND the ESPN scoreboards both failed (nothing usable; no POST is sent),
@@ -15,6 +16,7 @@
 import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { writeFile, mkdir } from 'node:fs/promises';
+import { gzipSync } from 'node:zlib';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { collectInputs } from './lib/sources.mjs';
@@ -31,7 +33,7 @@ function version() {
   try { return `${JSON.parse(readFileSync(resolve(HERE, 'package.json'), 'utf8')).version}-local`; } catch { return 'local'; }
 }
 
-const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--skip-injuries] [--quiet]';
+const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--skip-injuries] [--save-inputs FILE.json.gz] [--quiet]';
 
 async function main() {
   let args;
@@ -43,6 +45,7 @@ async function main() {
         settle: { type: 'boolean', default: false },
         'cache-dir': { type: 'string', default: '.cache' },
         'skip-injuries': { type: 'boolean', default: false },
+        'save-inputs': { type: 'string' },
         quiet: { type: 'boolean', default: false },
         help: { type: 'boolean', short: 'h', default: false },
       },
@@ -73,6 +76,12 @@ async function main() {
       log,
     });
     const snapshot = buildSnapshot(inputs, { now: t0, version: version(), runMs: Date.now() - t0 });
+    if (args['save-inputs']) {
+      const f = resolve(args['save-inputs']);
+      await mkdir(dirname(f), { recursive: true });
+      await writeFile(f, gzipSync(Buffer.from(JSON.stringify({ now: new Date(t0).toISOString(), inputs }), 'utf8')));
+      log(`saved inputs to ${args['save-inputs']}`);
+    }
     const pack = packSnapshot(snapshot);
     const sum = summarize(snapshot);
 

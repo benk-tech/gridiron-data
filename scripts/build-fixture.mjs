@@ -1,5 +1,7 @@
 // Build a snapshot from a raw capture folder with the collector's real code (offline, read-only on the folder).
-// usage: node scripts/build-fixture.mjs <rawDir> <out.json> [--now ISO] [--leagues nfl,cfb]
+// usage: node scripts/build-fixture.mjs <rawDir | inputs.json.gz> <out.json> [--now ISO] [--leagues nfl,cfb]
+//
+// inputs.json.gz is what `collect.mjs --save-inputs` writes ({ now, inputs }); it is rebuilt as is.
 //
 // rawDir layout (as captured for gridiron-picks/test/fixtures/raw-*):
 //   fetched_at.txt                  capture time (used as `now` unless --now is given)
@@ -9,7 +11,8 @@
 //   series_<SERIES>.json            optional GET /series/{t} responses (fees); defaults are flagged when absent
 //   collections.json                optional GET /multivariate_event_collections response
 
-import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
+import { gunzipSync } from 'node:zlib';
 import { join, resolve, dirname } from 'node:path';
 import { parseArgs } from 'node:util';
 import { buildSnapshot, summarize } from '../lib/build.mjs';
@@ -21,6 +24,17 @@ const [rawDir, outFile] = positionals;
 if (!rawDir || !outFile) {
   console.error('usage: node scripts/build-fixture.mjs <rawDir> <out.json> [--now ISO] [--leagues nfl,cfb]');
   process.exit(2);
+}
+if (statSync(resolve(rawDir)).isFile()) {
+  const saved = JSON.parse(gunzipSync(readFileSync(resolve(rawDir))).toString('utf8'));
+  const snap = buildSnapshot(saved.inputs, { now: opt.now || saved.now, version: 'rebuild', runMs: 0, ...(opt.leagues ? { leagues: opt.leagues.split(',') } : {}) });
+  const probs = validateSnapshot(snap);
+  if (probs.length) { console.error(`schema problems: ${probs.join(' | ')}`); process.exit(1); }
+  writeFileSync(resolve(outFile), JSON.stringify(snap));
+  const pk = packSnapshot(snap);
+  console.log(`wrote ${outFile}: ${pk.rawBytes} bytes, ${pk.gzBytes} gzip`);
+  console.log(JSON.stringify(summarize(snap)));
+  process.exit(0);
 }
 const dir = resolve(rawDir);
 const rd = (f) => JSON.parse(readFileSync(join(dir, f), 'utf8'));
