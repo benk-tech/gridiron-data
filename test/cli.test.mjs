@@ -136,6 +136,13 @@ test('ESPN answering 200 with empty scoreboards right after a full run: not post
     assert.equal(site.state.snapshots.length, 1, 'the last good snapshot stays up');
     assert.equal(readFileSync(histPath, 'utf8'), hist1, 'state not saved, so the next run still compares with the good run');
 
+    // both ESPN boards failing (HTTP 500) while Kalshi is fine: the same hold, not a 0 game snapshot over the good one
+    const down = await run([...common, '--now', '2026-10-11T23:01:00Z'], { ...env, FAKE_UPSTREAM: 'espn-down' });
+    assert.equal(down.code, 1, down.out);
+    assert.match(down.out, /snapshot not posted: no games in this run, but the previous run \(2026-10-11T22:51:00Z\) listed 76 upcoming games/);
+    assert.equal(site.state.snapshots.length, 1);
+    assert.equal(readFileSync(histPath, 'utf8'), hist1);
+
     // more than 6 hours after the last good run the hold lapses: the empty snapshot is posted, with ESPN flagged down
     site.state.lastTs = 0; // replay protection has its own tests; two posts can share a second here
     const later = await run([...common, '--now', '2026-10-12T04:56:00Z'], { ...env, FAKE_UPSTREAM: 'espn-empty' });
