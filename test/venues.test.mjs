@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FIX, RESEARCH_NOW, researchInputs } from './helpers.mjs';
 import { parsePolyUS, fetchPolyUSInputs, POLYUS_BASE } from '../lib/venues/polyus.mjs';
-import { parseGemini, fetchGeminiInputs, GEMINI_QUERY } from '../lib/venues/gemini.mjs';
+import { parseGemini, fetchGeminiInputs, strikeOf, GEMINI_QUERY } from '../lib/venues/gemini.mjs';
 import { parseSx, sxBook, fetchSxInputs } from '../lib/venues/sxbet.mjs';
 import { buildVenue, kalshiKeys, VENUE_KEYS } from '../lib/venues/index.mjs';
 import { Q, flipQ, foldPair, reorient, sortQuotes, keyOrder, VENUE_HEADERS } from '../lib/venues/common.mjs';
@@ -180,13 +180,36 @@ test('parseGemini: moneyline events with nested spread and total ladders, sides 
   // every key maps back to the contract it came from
   const ev = GM.data.find((e) => e.ticker === 'NFL-2610160015-SEA-DEN-M');
   const T = ev.events.find((e) => e.ticker.endsWith('-T'));
+  assert.ok(T.contracts.length >= 10 && T.contracts.every((c) => c.strike === undefined), 'production shape: no strike on nested ladders');
   for (const c of T.contracts) {
     const q = Q(c.prices.bestBid, c.prices.bestAsk);
-    if (q) assert.deepEqual(g.quotes[`tot:${c.strike.value}`], q, c.label);
+    const line = /^More than (\d+\.5) points scored$/.exec(c.label)[1];
+    if (q) assert.deepEqual(g.quotes[`tot:${line}`], q, c.label);
   }
   assert.ok(Object.keys(g.quotes).every((k) => KEY_RE.test(k)), 'first half and team total events ignored');
   // a game whose two winner contracts are each one sided still has no two sided book (FAU @ Army): no quote
   assert.equal(p.cfb.find((x) => x.id === 'NCAAF-2610171600-FAU-ARM').quotes['ml:home'], undefined);
+});
+
+test('parseGemini: the moneyline-only list sends nested ladders without a strike; the line is read from the label', () => {
+  // The collector's own request, untouched (3 events, 2026-10-13 00:54Z): no nested spread or total contract has a strike.
+  const S = GM.mlOnlySample.data;
+  const ladders = S.flatMap((e) => e.events.filter((n) => /-(S|T)$/.test(n.ticker))).flatMap((n) => n.contracts);
+  assert.ok(ladders.length > 100 && ladders.every((c) => c.strike === undefined), 'no strike on the nested ladders');
+  const p = parseGemini(S);
+  const n = Object.fromEntries([...p.nfl, ...p.cfb].map((g) => [g.id, Object.keys(g.quotes).length]));
+  assert.deepEqual(n, { 'NFL-2610130015-BUF-LAR': 43, 'NCAAF-2610132300-DEL-MTN': 34, 'NCAAF-2610140000-FIU-JAX': 29 });
+  const del = p.cfb.find((g) => g.id === 'NCAAF-2610132300-DEL-MTN');
+  const c = S[1].events.find((e) => e.ticker.endsWith('-S')).contracts.find((x) => x.ticker === 'DEL1');
+  assert.equal(c.label, 'Delaware wins by more than 1.5 points');
+  assert.deepEqual(del.quotes['sp:away:1.5'], Q(c.prices.bestBid, c.prices.bestAsk));
+  // strikeOf: the structured strike when sent, else the label; nothing for other wording
+  assert.deepEqual(strikeOf({ strike: { type: 'spread', value: '2.5' }, label: 'X wins by more than 9.5 points' }, 'S'), { type: 'spread', value: 2.5 });
+  assert.deepEqual(strikeOf({ label: 'Los Angeles R wins by more than 13.5 points' }, 'S'), { type: 'spread', value: 13.5 });
+  assert.deepEqual(strikeOf({ label: 'More than 47.5 points scored' }, 'T'), { type: 'over', value: 47.5 });
+  assert.deepEqual(strikeOf({ label: 'Fewer than 47.5 points scored' }, 'T'), { type: 'under', value: 47.5 });
+  assert.equal(strikeOf({ label: 'Over 47.5' }, 'T'), null);
+  assert.equal(strikeOf({ label: 'More than 47.5 points scored' }, 'S'), null, 'a total label is not a spread');
 });
 
 test('parseGemini: label fallback, under strikes, closed contracts, top-level and nested copies of an event', () => {

@@ -1,5 +1,5 @@
 // Trim saved research captures into the offline fixtures for the exchange reference venues (lib/venues).
-// usage: node scripts/make-venue-fixtures.mjs <research4 dir> <gemini list json>
+// usage: node scripts/make-venue-fixtures.mjs <research4 dir> <gemini list json> <gemini moneyline-only json>
 //   research4/polymarket/live/inputs.json.gz     collect.mjs --save-inputs capture at 2026-10-12T23:34Z: ESPN boards kept
 //   research4/polymarket/live/snapshot.json      the snapshot of that capture: Kalshi books per game, for orientation checks
 //   research4/polymarket/live/us_events_slim.json Polymarket US NFL + CFB events at 23:36:52Z (research slim copy; rebuilt
@@ -9,6 +9,11 @@
 //   research4/other-venues/sx-nfl-ml-snapshots.json  SX taker perspective books of the 15 NFL moneylines in the window
 //   <gemini list json>  GET /v1/prediction-markets/events?status=active&category=sports&sport=american_football
 //                       &sports_market_type=moneyline|spread|total&sports_market_scope=full_contest&limit=200 (2026-10-13T00:30:36Z)
+//                       Its winner events are kept with their nested ladders, and the nested contracts lose their
+//                       `strike`, which is what the collector's moneyline-only request returns (the strike is sent only
+//                       for the market types asked for).
+//   <gemini moneyline-only json>  the collector's own request (sports_market_type=moneyline only), limit=3, 00:54Z: kept as is
+//                       (trimmed), so the label path is also checked on an untouched response
 // Output: test/fixtures/venues/*.json.gz (gzipped compact JSON).
 
 import { readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
@@ -18,9 +23,9 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(ROOT, 'test', 'fixtures', 'venues');
-const [R, geminiFile] = process.argv.slice(2);
-if (!R || !geminiFile) {
-  console.error('usage: node scripts/make-venue-fixtures.mjs <research4 dir> <gemini list json>');
+const [R, geminiFile, geminiMlFile] = process.argv.slice(2);
+if (!R || !geminiFile || !geminiMlFile) {
+  console.error('usage: node scripts/make-venue-fixtures.mjs <research4 dir> <gemini list json> <gemini moneyline-only json>');
   process.exit(2);
 }
 const rd = (...p) => JSON.parse(readFileSync(join(...p), 'utf8'));
@@ -114,10 +119,13 @@ const trimGemEvent = (e) => ({
   contracts: (e.contracts || []).map(trimContract),
 });
 const keepNested = (n) => /-(S|T|1HM|TT)$/.test(n.ticker);
+const noStrike = (e) => ({ ...e, contracts: e.contracts.map(({ strike, ...c }) => c) });
+const gemMl = rd(geminiMlFile);
 save('gemini-20261013.json.gz', {
   fetchedAt: '2026-10-13T00:30:36Z',
   pagination: gem.pagination,
-  data: gem.data.filter((e) => /-M$/.test(e.ticker)).map((e) => ({ ...trimGemEvent(e), events: (e.events || []).filter(keepNested).map(trimGemEvent) })),
+  data: gem.data.filter((e) => /-M$/.test(e.ticker)).map((e) => ({ ...trimGemEvent(e), events: (e.events || []).filter(keepNested).map(trimGemEvent).map(noStrike) })),
+  mlOnlySample: { pagination: gemMl.pagination, data: gemMl.data.map((e) => ({ ...trimGemEvent(e), events: (e.events || []).filter(keepNested).map(trimGemEvent) })) },
 });
 
 // ---- SX Bet: the NFL game lines list and the moneyline books (taker perspective)
