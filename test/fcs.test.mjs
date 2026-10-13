@@ -227,10 +227,11 @@ test('part B fails open: a malformed or empty FCS board, or a crash, costs only 
   assert.equal(a.sources.fcs.ok, false);
   assert.match(a.sources.fcs.errors.join(' | '), /fcs: the scoreboard has no events list/);
   assert.equal(core(a), core(good));
-  // an empty regular season week: an outage
-  const b = buildSnapshot(partBInputs({ fcsBoards: [{ ...clone(FCS7), events: [] }] }), { now: T });
-  assert.equal(b.sources.fcs.ok, false);
-  assert.match(b.sources.fcs.errors.join(' | '), /fcs: the current regular season week lists no games/);
+  // an empty FCS week is not an outage (the FCS season ends a week before the FBS one): no games, no error
+  const b = buildSnapshot(partBInputs({ lookahead: false, fcsBoards: [{ ...clone(FCS7), events: [] }] }), { now: T });
+  assert.equal(b.sources.fcs.ok, true, b.sources.fcs.errors.join(' | '));
+  assert.equal(b.games.filter((g) => g.cls === 'CC').length, 0);
+  assert.equal(core(b), core(good));
   // a shape nobody has seen (competitors not a list): the part B build throws, core games unchanged
   const weird = clone(FCS7);
   weird.events[0].competitions[0].competitors = 5;
