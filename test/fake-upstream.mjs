@@ -5,6 +5,8 @@
 //   | 'espn-empty' (ESPN answers 200 with an empty events list on every scoreboard, as during an ESPN incident)
 // FAKE_PINNACLE: unset (default: the Pinnacle host answers 404 like any unknown host) | 'ok' (the 2026-10-12 capture,
 //   with its Last-Modified headers) | 'block' (HTTP 403, as a block of the runner's IP would look)
+// FAKE_VENUES: unset (default: the venue hosts answer 404 like any unknown host) | 'ok' (the saved Polymarket US,
+//   Gemini and SX Bet captures in test/fixtures/venues) | 'block' (HTTP 403) | per venue, e.g. 'polyus=ok,gemini=block,sx=ok'
 // Kalshi /markets/trades serves the saved trades of the tickers in test/fixtures/clv (an empty list for any other).
 import { readFileSync, existsSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
@@ -22,6 +24,30 @@ const gz = (...p) => JSON.parse(gunzipSync(readFileSync(join(DIR, '..', ...p))).
 const pinMode = process.env.FAKE_PINNACLE || '';
 const PIN = pinMode === 'ok' ? gz('pinnacle', 'pinnacle-20261012.json.gz') : null;
 const PIN_LEAGUE = { 889: 'nfl', 880: 'cfb' };
+const venueEnv = process.env.FAKE_VENUES || '';
+const venueMode = (v) => (venueEnv.includes('=') ? (Object.fromEntries(venueEnv.split(',').map((x) => x.split('=')))[v] || '') : venueEnv);
+const VEN = venueEnv ? { polyus: gz('venues', 'polyus-20261012.json.gz'), gemini: gz('venues', 'gemini-20261013.json.gz'), sx: gz('venues', 'sx-20261012.json.gz') } : null;
+const VENUE_HOST = { 'gateway.polymarket.us': 'polyus', 'api.gemini.com': 'gemini', 'api.sx.bet': 'sx' };
+function venueAnswer(v, url) {
+  const m = venueMode(v);
+  if (!m) return null;
+  if (m === 'block') return json('{"error":"forbidden"}', 403);
+  const off = Number(url.searchParams.get('offset') || 0), lim = Number(url.searchParams.get('limit') || 100);
+  if (v === 'polyus') {
+    const lg = /^\/v2\/leagues\/(nfl|cfb)\/events$/.exec(url.pathname)?.[1];
+    return lg ? json(JSON.stringify({ events: VEN.polyus[lg].slice(off, off + lim) })) : json('{}', 404);
+  }
+  if (v === 'gemini') {
+    if (url.pathname !== '/v1/prediction-markets/events') return json('{}', 404);
+    return json(JSON.stringify({ data: VEN.gemini.data.slice(off, off + lim), pagination: { limit: lim, offset: off, total: VEN.gemini.data.length } }));
+  }
+  if (url.pathname === '/markets/active') return json(JSON.stringify(url.searchParams.get('leagueId') === '243' ? VEN.sx.markets : { status: 'success', data: { markets: [] } }));
+  if (url.pathname === '/orderbook-v3/snapshot') {
+    const b = VEN.sx.books[url.searchParams.get('marketHash')];
+    return b ? json(JSON.stringify({ status: 'success', data: b })) : json('{"status":"failure"}', 404);
+  }
+  return json('{}', 404);
+}
 
 globalThis.fetch = async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input.url);
@@ -32,6 +58,10 @@ globalThis.fetch = async (input, init) => {
     const part = m && PIN[PIN_LEAGUE[m[1]]]?.[m[2] === 'matchups' ? 'matchups' : 'straight'];
     if (part) return new Response(JSON.stringify(part.body), { status: 200, headers: { 'content-type': 'application/json', 'last-modified': part.lastModified } });
     return json('[]', 404);
+  }
+  if (VENUE_HOST[url.hostname] && VEN) {
+    const r = venueAnswer(VENUE_HOST[url.hostname], url);
+    if (r) return r;
   }
   if (url.hostname.endsWith('kalshi.com')) {
     if (mode === 'kalshi-down' || mode === 'all-down') return json('{"error":"down"}', 503);

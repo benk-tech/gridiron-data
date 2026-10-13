@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Gridiron data collector (public data only: Kalshi markets, ESPN scoreboards, injuries and DK prop lines,
-// nflverse and sportsdataverse stats, Pinnacle guest prices).
+// nflverse and sportsdataverse stats, Pinnacle guest prices, and reference quotes from Polymarket US, Gemini
+// Predictions and SX Bet).
 //
 //   node collect.mjs --out snapshot.json      fetch, build, write the snapshot JSON
 //   node collect.mjs --post                   fetch, build, gzip + sign + POST to $INGEST_URL/api/ingest
@@ -10,10 +11,12 @@
 // Options:
 //   --cache-dir DIR    daily data (fees, nflverse, depth charts, CFB), default .cache; '' = no cache
 //   --state-dir DIR    run-to-run state: history.json (line moves, last 48 h), closes/ (staged closes), nflverse
-//                      check stamps, pinnacle.json (last Pinnacle pull, reused for 15 min), clv-closes.json (Kalshi
-//                      kickoff closes waiting for their settlement). Without it every run is a first run.
+//                      check stamps, pinnacle.json, gemini.json and sx.json (last pulls, each reused for 15 min),
+//                      clv-closes.json (Kalshi kickoff closes waiting for their settlement). Without it every run is a
+//                      first run.
 //   --closes-dir DIR   where finished ET days of closes are copied (default: closes/ next to this file); only with --state-dir
-//   --skip LIST        comma list of optional parts to skip: props,teamTotals,injuries,nflverse,cfb,pinnacle
+//   --skip LIST        comma list of optional parts to skip: props,teamTotals,injuries,nflverse,cfb,pinnacle,polyus,
+//                      gemini,sx
 //   --skip-injuries    same as --skip injuries
 //   --kalshi-gap-ms N  minimum gap between Kalshi requests (default 250; Kalshi answers 429 to bursts on /markets)
 //   --save-inputs FILE.json.gz   raw fetched inputs (rebuild offline with scripts/build-fixture.mjs)
@@ -43,6 +46,7 @@ import { CORE_SERIES_LIST, createKalshiClient } from './lib/kalshi.mjs';
 import { createHttp, errorText, withDeadline, budgetSignal, pacedFetch } from './lib/http.mjs';
 import { readHistoryFile, writeHistoryFile } from './lib/moves.mjs';
 import { writeClosesFile, syncClosesDir } from './lib/closes.mjs';
+import { VENUE_KEYS } from './lib/venues/index.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // The settle handshake (after the POST) gets its own budget so it can never hold the job past its timeout either.
@@ -53,7 +57,7 @@ function version() {
   try { return `${JSON.parse(readFileSync(resolve(HERE, 'package.json'), 'utf8')).version}-local`; } catch { return 'local'; }
 }
 
-const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb,pinnacle] [--skip-injuries] [--kalshi-gap-ms N] [--save-inputs FILE.json.gz] [--now ISO] [--quiet]';
+const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb,pinnacle,polyus,gemini,sx] [--skip-injuries] [--kalshi-gap-ms N] [--save-inputs FILE.json.gz] [--now ISO] [--quiet]';
 
 async function main() {
   let args;
@@ -151,6 +155,16 @@ async function main() {
     log(`injuries: ${sum.injuries} listed; angles ${sum.angles} ${JSON.stringify(sum.anglesByKind)}; defense nfl ${sum.defenseNfl}, cfb ${sum.defenseCfb}; players ${sum.players}; cfb QB changes ${sum.cfbQbChanges}`);
     log(`moves: ${sum.gameMoves} game, ${sum.propMoves} prop (history since ${snapshot.sources.moves.since ?? 'none'}); kalshi centers: ${sum.kalshiMoves} moves, ${snapshot.sources.moves.kalshiGames} games on record; closes this run ${run.closes.length}`);
     log(`pinnacle: ${Object.entries(sum.pinnacle).sort(([a], [b]) => (a < b ? 1 : -1)).map(([lg, b]) => `${lg} ${b.refs}/${b.pre} pregame games (${b.offBoard} off the board)`).join(', ')}; ${inputs.pinnacle ? (inputs.pinnacle.cached ? `reused the pull from ${inputs.pinnacle.attemptAt}` : `pulled, ${inputs.pinnacle.requests} requests`) : 'not fetched'}; unmatched ${snapshot.unmatched.pinnacle?.length ?? 0}`);
+    // Exchange reference venues: games with quotes per league, the pull (or the reused copy), timings and requests.
+    for (const v of VENUE_KEYS) {
+      const src = snapshot.sources[v];
+      const R = inputs.venues?.[v];
+      if (!src || !R) continue;
+      const by = Object.entries(sum.venues[v] || {}).filter(([lg]) => lg in (src.matchedByLeague || {})).sort(([a], [b]) => (a < b ? 1 : -1)).map(([lg, b]) => `${lg} ${b.refs}/${b.pre} pregame games (${b.quotes} quotes)`).join(', ');
+      const t = inputs.stats.bySource?.[v];
+      const um = run.venues?.[v]?.unmatched || [];
+      log(`${v}: ${by || 'no games'}; ${R.cached ? `reused the pull from ${R.attemptAt}` : `pulled, ${R.requests} requests`}${t ? ` in ${t.ms} ms` : ''}; unmatched ${um.length}${um.length ? ` (${um.slice(0, 3).join('; ')}${um.length > 3 ? '; ...' : ''})` : ''}`);
+    }
     for (const [k, s] of Object.entries(snapshot.sources)) {
       log(`source ${k}: ${s.ok ? 'ok' : 'NOT OK'}${s.errors.length ? `  ${s.errors.slice(0, 5).join(' | ')}${s.errors.length > 5 ? ` (+${s.errors.length - 5})` : ''}` : ''}`);
     }

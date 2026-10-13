@@ -9,6 +9,7 @@ It reads public, unauthenticated endpoints only:
 - ESPN core API DraftKings prop lines (`propBets`) for NFL games kicking off within 48 hours.
 - nflverse release files (play by play, weekly player stats, weekly rosters, PFR defensive stats) and the sportsdataverse college defense file, plus ESPN college team stats.
 - Pinnacle's public guest odds feed (`guest.api.arcadia.pinnacle.com/0.1/leagues/{889,880}/matchups` and `/markets/straight`, no key) as a second price source for the game lines. It is unofficial and undocumented, so it is optional: any failure leaves it out of the snapshot and nothing else changes.
+- Reference quotes from three other exchanges for the same game lines, no key: the Polymarket US public gateway (`gateway.polymarket.us/v2/leagues/{nfl,cfb}/events`), Gemini Predictions (`api.gemini.com/v1/prediction-markets/events`) and SX Bet (`api.sx.bet/markets/active` and `/orderbook-v3/snapshot`, an offshore exchange, NFL moneylines only). Only Kalshi is ever bet; these are reference prices (votes) for the site. Each is optional: a failure leaves that venue out and nothing else changes.
 - Kalshi trades before kickoff (`/markets/trades`) for the tracked picks the site asks about, to report the kickoff close.
 
 Each run turns those responses into one compact JSON snapshot (format v1), gzips it, and sends it to a private site with a signed request. Nothing in this repository computes picks or prices.
@@ -30,9 +31,9 @@ Options:
 | Option | Meaning |
 |---|---|
 | `--cache-dir DIR` | daily data: fee info, nflverse files, depth charts (6 hours), college stats; default `.cache`, `''` for none |
-| `--state-dir DIR` | run-to-run state: `history.json` (DraftKings lines and Kalshi implied centers of the last 48 hours, for line moves), `closes/` (closing lines waiting for their day to end), nflverse check stamps, `pinnacle.json` (the last Pinnacle pull, reused for 15 minutes), `clv-closes.json` (Kalshi kickoff closes waiting for their market to settle). Without it every run is a first run. |
+| `--state-dir DIR` | run-to-run state: `history.json` (DraftKings lines and Kalshi implied centers of the last 48 hours, for line moves), `closes/` (closing lines waiting for their day to end), nflverse check stamps, `pinnacle.json`, `gemini.json` and `sx.json` (the last pull of each, reused for 15 minutes), `clv-closes.json` (Kalshi kickoff closes waiting for their market to settle). Without it every run is a first run. |
 | `--closes-dir DIR` | where finished days of closing lines are copied (default `closes/` here) |
-| `--skip LIST` | skip optional parts: `props`, `teamTotals`, `injuries`, `nflverse`, `cfb`, `pinnacle` (`--skip-injuries` also works) |
+| `--skip LIST` | skip optional parts: `props`, `teamTotals`, `injuries`, `nflverse`, `cfb`, `pinnacle`, `polyus`, `gemini`, `sx` (`--skip-injuries` also works) |
 | `--kalshi-gap-ms N` | minimum gap between Kalshi requests, default 250 (Kalshi answers HTTP 429 to bursts on `/markets`) |
 | `--save-inputs FILE.json.gz` | keep the raw fetched inputs; `node scripts/build-fixture.mjs FILE.json.gz out.json` rebuilds the same snapshot offline |
 | `--now ISO` | run as if the clock read this time (game window, `generatedAt`, line history, closes); for tests and fixture rebuilds. Request signatures and time budgets always use the real clock. |
@@ -44,9 +45,9 @@ Exit code is 1 when nothing usable came back, when the POST to the site fails, o
 
 A source is also marked down (`ok: false`, with the reason in its errors) when its data arrived but cannot be right: ESPN scoreboard events that cannot be read, a current regular season or postseason week with no games, at least 5 games (and half) of the previous run's upcoming games missing, Kalshi markets or prop rungs with no price at all, no Kalshi game matching any ESPN game, or an injuries feed with nobody on it while NFL games are in the window. The site shows those sources as down instead of an empty slate.
 
-Every run has time budgets, so a host that accepts a connection and then stalls cannot hold the job past its 4 minute timeout: 100 seconds for all fetching, plus a shorter budget for each optional part (Pinnacle 25 s, team totals 30 s, injuries 45 s, props and college data 60 s, nflverse 75 s), all counted from the start of the run, and 30 seconds for the settle handshake. A spent budget stops that part's open requests, sends no new ones, and records `<part> time budget (N s) spent` in its errors; the snapshot is then built and posted with whatever arrived. DraftKings prop line requests use a 10 second timeout and no retry.
+Every run has time budgets, so a host that accepts a connection and then stalls cannot hold the job past its 4 minute timeout: 100 seconds for all fetching, plus a shorter budget for each optional part (Pinnacle 25 s, Gemini and SX Bet 30 s each, team totals 30 s, Polymarket US 40 s, injuries 45 s, props and college data 60 s, nflverse 75 s), all counted from the start of the run, and 30 seconds for the settle handshake. A spent budget stops that part's open requests, sends no new ones, and records `<part> time budget (N s) spent` in its errors; the snapshot is then built and posted with whatever arrived. DraftKings prop line requests use a 10 second timeout and no retry.
 
-A normal 5 minute run sends about 35 requests: Kalshi core, team totals and props (about 25, paced), ESPN scoreboards (4), the injuries feed (1) and DraftKings prop lines (2 per NFL game inside 48 hours). Every third run or so also pulls Pinnacle (4 requests, at most once per 15 minutes, since its CDN caches for 905 seconds anyway), and the settle step looks up at most 40 Kalshi kickoff closes per run (about 20 to 60 a week in all). Fee info, depth charts, nflverse and college data come from the cache; nflverse is checked with a HEAD request at most every 30 minutes and downloaded only when its ETag changes. A file that is missing upstream and has no cached copy (the new season's nflverse files from the March 1 rollover until September, or the new college season's file before late August) is asked for again only after 6 hours (30 minutes or 1 hour after other errors), with one HEAD request and no download; until then the source keeps reporting the error.
+A normal 5 minute run sends about 35 requests: Kalshi core, team totals and props (about 25, paced), ESPN scoreboards (4), the injuries feed (1) and DraftKings prop lines (2 per NFL game inside 48 hours). Polymarket US adds 4 requests every run (one page at a time; about 1.7 MB compressed, 65 MB of JSON, parsed page by page). Every third run or so also pulls Pinnacle (4 requests, at most once per 15 minutes, since its CDN caches for 905 seconds anyway), Gemini (1 request, about 7 MB) and SX Bet (1 list request plus about 15 book requests, 2 at a time), and the settle step looks up at most 40 Kalshi kickoff closes per run (about 20 to 60 a week in all). Fee info, depth charts, nflverse and college data come from the cache; nflverse is checked with a HEAD request at most every 30 minutes and downloaded only when its ETag changes. A file that is missing upstream and has no cached copy (the new season's nflverse files from the March 1 rollover until September, or the new college season's file before late August) is asked for again only after 6 hours (30 minutes or 1 hour after other errors), with one HEAD request and no download; until then the source keeps reporting the error.
 
 ## Layout
 
@@ -65,6 +66,9 @@ lib/cfb.mjs          college defense ratings and the weekly college QB check
 lib/csv.mjs          quote-aware CSV parser
 lib/moves.mjs        line history (DraftKings lines, Kalshi implied centers) and moves between runs
 lib/pinnacle.mjs     Pinnacle guest feed: pull every 15 minutes, trim, match to ESPN games, refs.pinnacle
+lib/venues/          exchange reference venues (refs.venues): common.mjs (quote shape, keys, GET, 15 minute state),
+                     polyus.mjs (Polymarket US, every run), gemini.mjs and sxbet.mjs (every 15 minutes), index.mjs
+                     (registry, matching to ESPN games, trimming to the Kalshi keys)
 lib/clv.mjs          Kalshi kickoff close (VWAP of the last 200 pregame trades) for the settle handshake
 lib/closes.mjs       closing lines archive (state/closes, then closes/ once a day is over)
 lib/build.mjs        pure buildSnapshot(inputs, { now }) / buildRun used by the CLI and the tests
@@ -134,6 +138,28 @@ refs: { pinnacle: {
 ```
 
 `sources.pinnacle` = `{ ok, fetchedAt, cached, requests, matched, matchedByLeague, errors }` (`matched` counts games with a block, off the board included). A failed league, a block (HTTP 403), a format change or a crash in the builder leaves the blocks out and sets `ok: false`; the rest of the snapshot is built exactly as without Pinnacle.
+
+## Exchange reference quotes (`games[i].refs.venues`)
+
+Only Kalshi is ever bet. Polymarket US, Gemini Predictions and SX Bet are read as reference prices (votes) for the site's cross market check; none of them is a betting target here. Polymarket US is pulled every run; Gemini and SX Bet at most once per 15 minutes (`state/gemini.json`, `state/sx.json` keep the last pull, failed or not, and runs in between reuse it with its original `fetchedAt`). Venue games are matched to ESPN games with the same matcher as Kalshi and Pinnacle (Eastern date within a day, both teams, score 0.9 or more), after a shared name table (Pinnacle's, plus NM State, LA Tech and Hawaii) and, for Gemini, both its full team name and its short label. Only pregame games get a block, always in ESPN's home and away order, and only for the contracts the game's Kalshi markets list (plus the moneyline):
+
+```js
+refs: { venues: {
+  polyus: { fetchedAt, quotes: { 'ml:home': Quote, 'sp:away:3.5': Quote, 'tot:44.5': Quote, ... } },
+  gemini: { fetchedAt, quotes },
+  sx:     { fetchedAt, quotes },   // NFL moneyline only
+} }
+// keys: 'ml:home' = P(home wins); 'sp:home:3.5' / 'sp:away:3.5' = P(that team wins by more than 3.5); 'tot:44.5' = P(over 44.5)
+// half point strikes only. Quote = { bid, ask, bidSize, askSize, sizeUnit } for YES of the key (NO is bought at 1 - bid)
+// two sided and uncrossed only. Sizes are contracts at the best price (SX Bet: taker stake / price) or null with
+// sizeUnit null (the Polymarket US events payload and the Gemini REST snapshot carry prices only).
+```
+
+Orientation: the Polymarket US winner market's long side is the away team, and spread rungs are quoted for the long team (a positive line means the long team gets the points, so its YES is NO of the other team winning by more than the line); Gemini's two winner contracts are folded like Kalshi's two winner markets, and its spread contracts are assigned to a team by their ticker prefix; SX Bet's team one is the home team (the matcher's flip covers any exception). On the 2026-10-12 capture every tight pair against Kalshi on the same contract was within 3 cents (Polymarket US 956 pairs, median 0.25 cents; Gemini 299, median 0; SX Bet 13, median 0.56).
+
+`sources.polyus`, `sources.gemini`, `sources.sx` = `{ ok, fetchedAt, cached, requests, matched, matchedByLeague, errors }`, present only when the venue was fetched (absent with `--skip`). A failed league, a block, a format change or a crash in the builder leaves that venue's blocks out and sets `ok: false`; the rest of the snapshot is built exactly as without it. These sources are optional, like Pinnacle: the site must list them in its optional sources so a venue being down never raises the "sources are down" banner. Unmatched venue games (mostly FCS) are logged, not stored.
+
+Every endpoint above was checked from a residential IP; GitHub Actions runner IPs are untested.
 
 ## Kickoff closes (settle handshake)
 
