@@ -7,6 +7,9 @@
 //   with its Last-Modified headers) | 'block' (HTTP 403, as a block of the runner's IP would look)
 // FAKE_VENUES: unset (default: the venue hosts answer 404 like any unknown host) | 'ok' (the saved Polymarket US,
 //   Gemini and SX Bet captures in test/fixtures/venues) | 'block' (HTTP 403) | per venue, e.g. 'polyus=ok,gemini=block,sx=ok'
+// FAKE_FCS: unset (default: groups=81 college boards answer with an empty events list, the week boards as before) |
+//   'ok' (the 2026-10-13 captures in test/fixtures/fcs: groups=81 default = week 7, groups=81 and groups=80 week 8;
+//   any other week board an empty list)
 // Kalshi /markets/trades serves the saved trades of the tickers in test/fixtures/clv (an empty list for any other).
 import { readFileSync, existsSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
@@ -28,6 +31,20 @@ const venueEnv = process.env.FAKE_VENUES || '';
 const venueMode = (v) => (venueEnv.includes('=') ? (Object.fromEntries(venueEnv.split(',').map((x) => x.split('=')))[v] || '') : venueEnv);
 const VEN = venueEnv ? { polyus: gz('venues', 'polyus-20261012.json.gz'), gemini: gz('venues', 'gemini-20261013.json.gz'), sx: gz('venues', 'sx-20261012.json.gz') } : null;
 const VENUE_HOST = { 'gateway.polymarket.us': 'polyus', 'api.gemini.com': 'gemini', 'api.sx.bet': 'sx' };
+const fcsMode = process.env.FAKE_FCS || '';
+const FCS_BOARDS = fcsMode === 'ok' ? {
+  '81:': gz('fcs', 'espn-cfb-fcs-w7.json.gz'), '81:8': gz('fcs', 'espn-cfb-fcs-w8.json.gz'), '80:8': gz('fcs', 'espn-cfb-fbs-w8.json.gz'),
+} : null;
+// A college board request this mode answers (groups=81 always; the week boards only with FAKE_FCS=ok), else null.
+function collegeBoard(url) {
+  if (!url.pathname.includes('/college-football/') || !url.pathname.endsWith('/scoreboard')) return null;
+  const groups = url.searchParams.get('groups') || '80';
+  const week = url.searchParams.get('week') || '';
+  if (groups !== '81' && !(FCS_BOARDS && week)) return null;
+  if (mode === 'espn-empty' || !FCS_BOARDS) return json('{"events":[]}');
+  const b = FCS_BOARDS[`${groups}:${week}`];
+  return json(JSON.stringify(b || { events: [] }));
+}
 function venueAnswer(v, url) {
   const m = venueMode(v);
   if (!m) return null;
@@ -86,6 +103,8 @@ globalThis.fetch = async (input, init) => {
     if (url.pathname.endsWith('/summary')) return json('{"injuries":[]}');
     if (url.pathname.endsWith('/injuries')) return json(INJURIES);
     if (url.pathname.endsWith('/depthcharts')) return json('{"depthchart":[]}');
+    const cb = collegeBoard(url);
+    if (cb) return cb;
     if (url.searchParams.get('week')) return json('{"events":[]}');
     if (mode === 'espn-empty' && url.pathname.endsWith('/scoreboard')) {
       const b = JSON.parse(rd(url.pathname.includes('/nfl/') ? 'espn_nfl_w6.json' : 'espn_cfb_w7.json'));

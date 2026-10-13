@@ -1,22 +1,26 @@
 #!/usr/bin/env node
 // Gridiron data collector (public data only: Kalshi markets, ESPN scoreboards, injuries and DK prop lines,
 // nflverse and sportsdataverse stats, Pinnacle guest prices, reference quotes from Polymarket US, Gemini
-// Predictions and SX Bet, and line free rating inputs from nflverse and sportsdataverse).
+// Predictions and SX Bet, line free rating inputs from nflverse and sportsdataverse, and the FCS and lookahead
+// college boards).
 //
 //   node collect.mjs --out snapshot.json      fetch, build, write the snapshot JSON
 //   node collect.mjs --post                   fetch, build, gzip + sign + POST to $INGEST_URL/api/ingest
 //   node collect.mjs --settle                 pending/settle handshake only (or together with --post), with Kalshi
-//                                             kickoff closes (closeYes) when the site lists { ticker, kickoff }
+//                                             kickoff closes (closeYes) when the site lists { ticker, kickoff }, and
+//                                             the game's DK close (closeRef) from the closes archive
 //
 // Options:
 //   --cache-dir DIR    daily data (fees, nflverse, depth charts, CFB, rating input reductions), default .cache; '' = no cache
 //   --state-dir DIR    run-to-run state: history.json (line moves, last 48 h), closes/ (staged closes), nflverse
-//                      and rating input check stamps, pinnacle.json, gemini.json and sx.json (last pulls, each reused for 15 min),
+//                      and rating input check stamps, pinnacle.json, gemini.json, sx.json and espn-extra.json (the FCS
+//                      and lookahead boards) (last pulls, each reused for 15 min),
 //                      clv-closes.json (Kalshi kickoff closes waiting for their settlement). Without it every run is a
 //                      first run.
 //   --closes-dir DIR   where finished ET days of closes are copied (default: closes/ next to this file); only with --state-dir
 //   --skip LIST        comma list of optional parts to skip: props,teamTotals,injuries,nflverse,cfb,pinnacle,polyus,
-//                      gemini,sx,ratinginputs
+//                      gemini,sx,ratinginputs,fcs,lookahead. --skip fcs,lookahead (with ratinginputs) leaves the
+//                      snapshot byte for byte as it was before those parts existed.
 //   --skip-injuries    same as --skip injuries
 //   --kalshi-gap-ms N  minimum gap between Kalshi requests (default 250; Kalshi answers 429 to bursts on /markets)
 //   --save-inputs FILE.json.gz   raw fetched inputs (rebuild offline with scripts/build-fixture.mjs)
@@ -57,7 +61,7 @@ function version() {
   try { return `${JSON.parse(readFileSync(resolve(HERE, 'package.json'), 'utf8')).version}-local`; } catch { return 'local'; }
 }
 
-const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb,pinnacle,polyus,gemini,sx,ratinginputs] [--skip-injuries] [--kalshi-gap-ms N] [--save-inputs FILE.json.gz] [--now ISO] [--quiet]';
+const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb,pinnacle,polyus,gemini,sx,ratinginputs,fcs,lookahead] [--skip-injuries] [--kalshi-gap-ms N] [--save-inputs FILE.json.gz] [--now ISO] [--quiet]';
 
 async function main() {
   let args;
@@ -159,6 +163,11 @@ async function main() {
       const riGz = snapshot.ratingInputs ? gzipSync(Buffer.from(JSON.stringify(snapshot.ratingInputs), 'utf8')).length : 0;
       log(`ratingInputs: ${ri ? `nfl ${ri.nflGames} games (through week ${ri.throughWeek ?? 'none'}), ${ri.teamGames} team games, ${ri.qbGames} QB games, ${ri.starters} starters; cfb ${ri.cfbGames} games (${ri.cfbFinals} final), ${ri.eff} with box efficiency, ${ri.effMissing ?? 'n/a'} finals missing it; ${(riGz / 1024).toFixed(1)} KB gzip` : 'none'}; ${inputs.ratingInputs?.requests ?? 0} requests`);
     }
+    if (snapshot.sources.fcs || snapshot.sources.lookahead) {
+      const cls = Object.entries(sum.classes).sort().map(([k, n]) => `${k} ${n}`).join(', ');
+      const part = (k) => { const s = snapshot.sources[k]; const I = inputs[k]; return s ? `${k} ${s.boards} board(s), ${I?.reused ?? 0} reused, ${s.requests} requests` : null; };
+      log(`part B: cfb classes ${cls || 'none'}; FCS vs FCS ${snapshot.sources.fcs ? `${snapshot.sources.fcs.games} in the window, ${snapshot.sources.fcs.lookaheadGames} lookahead` : 'skipped'}; lookahead games ${snapshot.sources.lookahead ? sum.lookahead : 'skipped'}; ${['fcs', 'lookahead'].map(part).filter(Boolean).join('; ')}`);
+    }
     log(`pinnacle: ${Object.entries(sum.pinnacle).sort(([a], [b]) => (a < b ? 1 : -1)).map(([lg, b]) => `${lg} ${b.refs}/${b.pre} pregame games (${b.offBoard} off the board)`).join(', ')}; ${inputs.pinnacle ? (inputs.pinnacle.cached ? `reused the pull from ${inputs.pinnacle.attemptAt}` : `pulled, ${inputs.pinnacle.requests} requests`) : 'not fetched'}; unmatched ${snapshot.unmatched.pinnacle?.length ?? 0}`);
     // Exchange reference venues: games with quotes per league, the pull (or the reused copy), timings and requests.
     for (const v of VENUE_KEYS) {
@@ -225,7 +234,9 @@ async function main() {
     try {
       const fetchImpl = withDeadline(globalThis.fetch, budget.signal);
       const kalshi = createKalshiClient({ http: createHttp({ fetchImpl: withDeadline(pacer, budget.signal), retries: 0 }) });
-      await settleHandshake({ url: ingest.url, key: ingest.key, kalshi, fetchImpl, log, now: t0, stateDir });
+      // closeRef: the staged closes first (this run's included), then the repo archive
+      const closeDirs = [stateDir ? join(stateDir, 'closes') : null, closesDir];
+      await settleHandshake({ url: ingest.url, key: ingest.key, kalshi, fetchImpl, log, now: t0, stateDir, closeDirs });
     } catch (e) {
       // A failed settle is retried on the next run; it does not fail the job.
       console.warn(`settle skipped: ${errorText(e)}`);

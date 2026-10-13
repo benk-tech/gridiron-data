@@ -65,10 +65,12 @@ jobs:
       # site would go stale. The offline tests run on push and pull request instead (test.yml).
       # The collector stops fetching at its own time budget (about 100 s) and posts what it has; the step timeout is
       # only a backstop that still leaves time for the always() steps below inside the 4 minute job.
+      # --skip fcs,lookahead keeps FCS vs FCS games and the 9 to 16 day college lookahead out of the snapshot until the
+      # site is ready to show them (they add about 110 to 215 games). To turn them on, delete the flag.
       - id: collect
         name: Collect, post, settle
         timeout-minutes: 3
-        run: node collect.mjs --post --settle --cache-dir cache --state-dir state
+        run: node collect.mjs --post --settle --cache-dir cache --state-dir state --skip fcs,lookahead
         env:
           INGEST_URL: ${{ secrets.INGEST_URL }}
           INGEST_KEY: ${{ secrets.INGEST_KEY }}

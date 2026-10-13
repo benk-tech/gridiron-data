@@ -30,7 +30,10 @@ test("closesFromTransition: 'pre' to 'in' emits the last pregame lines once", ()
   const closes = closesFromTransition(prev, games, [], { now });
   assert.equal(closes.length, 1);
   const c = closes[0];
-  assert.deepEqual(Object.keys(c), ['gameId', 'league', 'kickoff', 'home', 'away', 'lastPregameAt', 'odds', 'dkTeamTotals', 'props']);
+  assert.deepEqual(Object.keys(c), ['gameId', 'league', 'kickoff', 'home', 'away', 'lastPregameAt', 'odds', 'firstLine', 'dkTeamTotals', 'props', 'events']);
+  // firstLine: the first DK line the collector saw (2 h before kickoff, spread -3), kept while the line moved to -3.5
+  assert.equal(c.firstLine.at, '2026-10-11T22:20:00Z');
+  assert.equal(c.firstLine.odds.spread.home, -3);
   assert.equal(c.gameId, 'nfl-401872993');
   assert.equal(c.lastPregameAt, '2026-10-12T00:15:00Z');
   assert.equal(c.odds.spread.home, -3.5, 'last pregame line, not the in-game 7');

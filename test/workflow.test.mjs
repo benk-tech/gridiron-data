@@ -39,3 +39,12 @@ test('collect.yml: the collect step has its own timeout inside the 4 minute job,
     assert.match(collect, new RegExp(`name: ${name}\\n\\s+if: \\$\\{\\{ always\\(\\) && steps\\.collect\\.outcome != 'skipped' \\}\\}`), name);
   }
 });
+
+test('collect.yml: every part a --skip names on the collect step is a real part (a typo would refuse to run)', async () => {
+  const { PART_KEYS } = await import('../lib/sources.mjs');
+  const collect = code(read('collect.yml'));
+  const line = /run: (node collect\.mjs [^\n]*)/.exec(collect)?.[1] || '';
+  const skip = /--skip\s+(\S+)/.exec(line)?.[1];
+  if (!skip) return;
+  for (const p of skip.split(',')) assert.ok(PART_KEYS.includes(p), `unknown part ${p} in collect.yml`);
+});

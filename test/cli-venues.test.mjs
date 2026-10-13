@@ -109,5 +109,5 @@ test('collect.mjs: venues pulled on their cadence, logged, reused from state; bl
 test('collect.mjs: unknown --skip names are refused; the venue names are known', async () => {
   const r = await run(['--out', 'x.json', '--skip', 'polyus,novig'], {});
   assert.equal(r.code, 2);
-  assert.match(r.out, /unknown --skip part\(s\): novig \(known: props, teamTotals, injuries, nflverse, cfb, pinnacle, polyus, gemini, sx, ratinginputs\)/);
+  assert.match(r.out, /unknown --skip part\(s\): novig \(known: props, teamTotals, injuries, nflverse, cfb, pinnacle, polyus, gemini, sx, ratinginputs, fcs, lookahead\)/);
 });
