@@ -163,6 +163,15 @@ test('nflStarters: depth chart QB1, the next QB when QB1 is Out or Doubtful, gsi
   const d = nflStarters({ games: SCHED, depth: DEPTH, injuryItems: null, bridge: BRIDGE, at: null });
   assert.equal(d.find((x) => x.team === 'ATL').status, 'Questionable');
   assert.equal(d.find((x) => x.team === 'CHI').source, 'depth');
+  // the feed has no row but the chart says Out: the chart's note counts (the injury lists' rule); a newer feed row
+  // beats an older chart note; a chart note about a signing is not an injury
+  const chartOut = { 1: { ...DEPTH[1], offense: { qb: [{ id: '11', name: 'Atl One', pos: 'QB', inj: { status: 'Out', date: '2026-10-12T10:00Z', comment: 'Ruled out with a rib injury.' } }, QB('12', 'Atl Two')] } } };
+  const c1 = nflStarters({ games: SCHED, depth: chartOut, injuryItems: [ITEM('99', 'Out')], bridge: BRIDGE });
+  assert.deepEqual([c1[0].source, c1[0].espnId, c1[0].replaced.status], ['depth_injury', '12', 'Out']);
+  const c2 = nflStarters({ games: SCHED, depth: chartOut, injuryItems: [ITEM('11', 'Questionable', '2026-10-13T09:00Z')], bridge: BRIDGE });
+  assert.deepEqual([c2[0].source, c2[0].status], ['depth', 'Questionable']);
+  const signed = { 1: { ...DEPTH[1], offense: { qb: [{ id: '11', name: 'Atl One', pos: 'QB', inj: { status: 'Out', date: '2026-10-12T10:00Z', comment: 'Signed with Atlanta on Monday.' } }] } } };
+  assert.equal(nflStarters({ games: SCHED, depth: signed, injuryItems: [], bridge: BRIDGE })[0].source, 'depth');
   // every QB on the chart out: no row
   assert.equal(nflStarters({ games: SCHED, depth: { 1: DEPTH[1] }, injuryItems: [ITEM('11', 'Out'), ITEM('12', 'Injured Reserve')], bridge: BRIDGE }).length, 0);
   // a Map of charts (what build.mjs passes) works the same
