@@ -18,7 +18,7 @@ const MIN = 60e3;
 const BALATL = 'nfl-401872993';
 const BUFLAR = 'nfl-401872994';
 const HENRY = '3043078';
-const DASH = new RegExp('[' + String.fromCharCode(0x2013, 0x2014) + ']'); // en and em dash (Ben's rule)
+const DASH = new RegExp('[' + String.fromCharCode(0x2013, 0x2014) + ']'); // en and em dash (house style)
 
 const INJ = gz('injuries-research-20261011.json.gz');
 const PB = rd('props', 'kalshi-balatl-2357z.json').markets;
