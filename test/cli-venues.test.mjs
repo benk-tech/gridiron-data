@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { validateSnapshot } from '../lib/schema.mjs';
+import { foldKalshiBook } from '../lib/moves.mjs';
 import { RESEARCH_NOW } from './helpers.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -26,10 +27,12 @@ function run(args, env) {
   });
 }
 const at = (min) => new Date(Date.parse(RESEARCH_NOW) + min * 60e3).toISOString().replace(/\.\d{3}Z$/, 'Z');
-// DK odds carry the real fetch time, which differs between runs
+// DK odds carry the real fetch time, which differs between runs; Kalshi's previous run book (prevQuotes, prevAt) is
+// run to run state, present from the second run on
 const games = (s, { keepVenues = false } = {}) => s.games.map((g) => {
   const c = JSON.parse(JSON.stringify({ ...g, odds: g.odds && { ...g.odds, fetchedAt: null } }));
   if (!keepVenues && c.refs) { delete c.refs.venues; if (!Object.keys(c.refs).length) delete c.refs; }
+  delete c.kalshi.prevQuotes; delete c.kalshi.prevAt;
   return c;
 });
 
@@ -68,6 +71,18 @@ test('collect.mjs: venues pulled on their cadence, logged, reused from state; bl
     const g2 = s2.games.find((g) => g.refs?.venues?.sx);
     assert.equal(g2.refs.venues.sx.fetchedAt, at(0));
     assert.equal(g2.refs.venues.polyus.fetchedAt, at(5));
+    // Kalshi's book from the previous run: none on the first run (no history), on every game with venue quotes from
+    // the second run on, stamped with that run's time
+    assert.ok(s1.games.every((g) => g.kalshi.prevQuotes === undefined && g.kalshi.prevAt === undefined), 'first run: no previous book');
+    assert.equal(s1.sources.moves.prevBooks, 0);
+    const withPrev = s2.games.filter((g) => g.kalshi.prevQuotes);
+    // (a game whose Kalshi book is one sided on every key, like a 99 to 1 favorite, has nothing to carry)
+    const missing = s2.games.filter((g) => g.refs?.venues && Object.keys(foldKalshiBook(g)).length && !(g.kalshi.prevQuotes && g.kalshi.prevAt === at(0)));
+    assert.deepEqual(missing.map((g) => g.id), []);
+    assert.ok(withPrev.length >= 70, `${withPrev.length}`);
+    assert.equal(s2.sources.moves.prevBooks, withPrev.length);
+    assert.match(r2.out, new RegExp(`previous run Kalshi books on ${withPrev.length} games`));
+    assert.deepEqual(validateSnapshot(s2), []);
 
     // 15 minutes after the first pull, every venue host blocks the runner (HTTP 403): no venue refs, the rest as before
     const r3 = await run(['--out', join(tmp, 's3.json'), ...common, '--now', at(15)], { FAKE_VENUES: 'block' });

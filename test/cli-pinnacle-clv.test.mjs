@@ -58,7 +58,12 @@ test('collect.mjs: Pinnacle pulled, reused for 15 minutes, and a blocked pull fa
     const s3 = snap(3);
     assert.ok(s3.games.every((g) => !('refs' in g)));
     // (DK odds carry the real fetch time, which differs between runs)
-    const strip = (s) => s.games.map((g) => { const c = { ...g, odds: g.odds && { ...g.odds, fetchedAt: null } }; delete c.refs; return c; });
+    // Kalshi's previous run book (kalshi.prevQuotes, prevAt) is run to run state: present from the second run on
+    const strip = (s) => s.games.map((g) => {
+      const c = { ...g, odds: g.odds && { ...g.odds, fetchedAt: null }, kalshi: { ...g.kalshi } };
+      delete c.refs; delete c.kalshi.prevQuotes; delete c.kalshi.prevAt;
+      return c;
+    });
     assert.deepEqual(strip(s3), strip(s1), 'everything else is as before');
     assert.deepEqual(validateSnapshot(s3), []);
   } finally {

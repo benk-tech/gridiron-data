@@ -64,11 +64,11 @@ lib/injuries.mjs     NFL injuries graded per game from the league feed and depth
 lib/nflverse.mjs     NFL defense ratings (run, pass, front, secondary) and player stats from nflverse
 lib/cfb.mjs          college defense ratings and the weekly college QB check
 lib/csv.mjs          quote-aware CSV parser
-lib/moves.mjs        line history (DraftKings lines, Kalshi implied centers) and moves between runs
+lib/moves.mjs        line history (DraftKings lines, Kalshi implied centers, Kalshi's folded book) and moves between runs
 lib/pinnacle.mjs     Pinnacle guest feed: pull every 15 minutes, trim, match to ESPN games, refs.pinnacle
 lib/venues/          exchange reference venues (refs.venues): common.mjs (quote shape, keys, GET, 15 minute state),
                      polyus.mjs (Polymarket US, every run), gemini.mjs and sxbet.mjs (every 15 minutes), index.mjs
-                     (registry, matching to ESPN games, trimming to the Kalshi keys)
+                     (registry, matching to ESPN games, trimming to the Kalshi keys, format checks)
 lib/clv.mjs          Kalshi kickoff close (VWAP of the last 200 pregame trades) for the settle handshake
 lib/closes.mjs       closing lines archive (state/closes, then closes/ once a day is over)
 lib/build.mjs        pure buildSnapshot(inputs, { now }) / buildRun used by the CLI and the tests
@@ -122,6 +122,22 @@ kalshiMoves: [{ market: 'ml' | 'spread' | 'total', from, to, at }]   // every ga
 
 Same shape and order as `games[i].moves` (oldest first, then ml, spread, total). The snapshot carries at most the newest 20 moves per market per game; the history keeps up to 200 points per market. `sources.moves.kalshiGames` counts the games with Kalshi points on record. A history file from before this change loads as is and starts its Kalshi points on the next run.
 
+These centers say when a whole line moved. They do not say that one contract held still: a single ladder rung, or the away team's winner market on its own, can reprice without moving a center, and a first run has an empty list for every game. That is what the previous run's book below is for.
+
+## Kalshi's book on the previous run (`games[i].kalshi.prevQuotes`)
+
+The site calls a Kalshi price a cross market bet only when it held for one run (a price that just changed may be Kalshi reacting to news first). So every run also keeps Kalshi's book for each pregame game in `state/history.json` (`book` and `bookAt` on the game), and the next run puts it on the snapshot:
+
+```js
+kalshi: {
+  ...,
+  prevQuotes: { 'ml:home': { bid, ask }, 'sp:away:3.5': { bid, ask }, 'tot:44.5': { bid, ask } },   // the previous run's book
+  prevAt: '2026-10-11T22:51:00Z',                                                               // that run's time
+}
+```
+
+The book uses the same contract keys as the exchange quotes below and the same fold as the site (`foldKalshiBook`; a test checks it against the site engine on its fixtures): YES of `'ml:home'` is YES on the home winner market or NO on the away one, whichever is cheaper, so ask = min(home YES ask, away NO ask) and bid = 1 - min(home NO ask, away YES ask); a NO ask is `noAsk`, else 1 - `yesBid`; a size of 0 or less is no offer; only active markets; spread and total rungs are their own market (half point strikes only); a key needs both sides. Both fields are there only when the previous run is in the history and is 0 to 60 minutes old, that run recorded this game's book, and the game is still pregame, and only for keys both runs quote. A first run, a lost or expired Actions cache, a history over an hour old, or a game new to the board has no `prevQuotes`, never an empty stand-in. `sources.moves.prevBooks` counts the games that got one. No extra requests; about 15 KB more per gzipped snapshot on a full slate.
+
 ## Pinnacle prices (`games[i].refs.pinnacle`)
 
 Pulled at most once per 15 minutes (`state/pinnacle.json` keeps the last pull, failed or not, and runs in between reuse it). Pinnacle games are matched to ESPN games with the same matcher as Kalshi (Eastern date within a day, both teams), after a small name table for the schools Pinnacle names differently (Miami Florida, Mississippi, UL Lafayette, Sam Houston State, Hawaii, Miami Ohio, Middle Tennessee State), and only on a match score of 0.9 or more. Pinnacle games in the window that matched nothing are listed in `unmatched.pinnacle`. Only pregame games get a block, always in ESPN's home and away order:
@@ -157,7 +173,9 @@ refs: { venues: {
 
 Orientation: the Polymarket US winner market's long side is the away team, and spread rungs are quoted for the long team (a positive line means the long team gets the points, so its YES is NO of the other team winning by more than the line); Gemini's two winner contracts are folded like Kalshi's two winner markets, its spread contracts are assigned to a team by their ticker prefix, and its ladder lines are read from the contract label ("Seattle wins by more than 3.5 points", "More than 44.5 points scored") because the moneyline-only request does not send the structured strike; SX Bet's team one is the home team (the matcher's flip covers any exception). On the 2026-10-12 capture every tight pair against Kalshi on the same contract was within 3 cents (Polymarket US 956 pairs, median 0.25 cents; Gemini 299, median 0; SX Bet 13, median 0.56).
 
-`sources.polyus`, `sources.gemini`, `sources.sx` = `{ ok, fetchedAt, cached, requests, matched, matchedByLeague, errors }`, present only when the venue was fetched (absent with `--skip`). A failed league, a block, a format change or a crash in the builder leaves that venue's blocks out and sets `ok: false`; the rest of the snapshot is built exactly as without it. These sources are optional, like Pinnacle: the site must list them in its optional sources so a venue being down never raises the "sources are down" banner. Unmatched venue games (mostly FCS) are logged, not stored.
+`sources.polyus`, `sources.gemini`, `sources.sx` = `{ ok, fetchedAt, cached, requests, matched, matchedByLeague, errors }`, present only when the venue was fetched (absent with `--skip`). A failed league, a block or a crash in the builder leaves that venue's blocks out and sets `ok: false`; the rest of the snapshot is built exactly as without it. A format change sets `ok: false` too: each fetcher counts what it saw listed (`seen`, per league), and five or more listings with no game read, or five or more games with no quote of a kind the venue always lists (winner, spread and total on Polymarket US and Gemini; winner on SX Bet), is an error such as "nfl: 29 polyus listings seen but none could be read (format change?)". Whatever could still be read is kept. A league where no venue game matched any ESPN game is an error as before.
+
+Request budget for the three venues: Polymarket US about 4 GETs every run (one page at a time); Gemini 1 GET (at most 3 pages) and SX Bet 1 list GET plus about 15 order book GETs (2 at a time), each at most once per 15 minutes; so about 10 requests per run on average and never more than about 24 in one run. A 4xx (a block) is never retried; a network error or a 5xx is retried once. These sources are optional, like Pinnacle: the site must list them in its optional sources so a venue being down never raises the "sources are down" banner. Unmatched venue games (mostly FCS) are logged, not stored.
 
 Every endpoint above was checked from a residential IP; GitHub Actions runner IPs are untested.
 

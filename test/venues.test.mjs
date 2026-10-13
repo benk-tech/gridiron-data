@@ -11,7 +11,7 @@ import { FIX, RESEARCH_NOW, researchInputs } from './helpers.mjs';
 import { parsePolyUS, fetchPolyUSInputs, POLYUS_BASE } from '../lib/venues/polyus.mjs';
 import { parseGemini, fetchGeminiInputs, strikeOf, GEMINI_QUERY } from '../lib/venues/gemini.mjs';
 import { parseSx, sxBook, fetchSxInputs } from '../lib/venues/sxbet.mjs';
-import { buildVenue, kalshiKeys, VENUE_KEYS } from '../lib/venues/index.mjs';
+import { buildVenue, kalshiKeys, VENUE_KEYS, VENUES, DRIFT_MIN, venueFormatErrors } from '../lib/venues/index.mjs';
 import { Q, flipQ, foldPair, reorient, sortQuotes, keyOrder, VENUE_HEADERS } from '../lib/venues/common.mjs';
 import { teamScore } from '../lib/match.mjs';
 import { buildSnapshot, buildRun, summarize } from '../lib/build.mjs';
@@ -475,4 +475,102 @@ test('buildVenue: nothing matched while both sides list games is a format error;
     { type: 'total', team: null, strike: 44.5 }, { type: 'teamTotal', team: 'home', strike: 20.5 },
   ] } };
   assert.deepEqual([...kalshiKeys(g)], ['ml:home', 'sp:away:3.5', 'tot:44.5']);
+});
+
+// ---------------------------------------------------------------- format drift: a parser that silently drops everything
+
+// The three fetchers against the saved captures through a fake fetch; mutate(payload) changes the upstream format.
+async function polyusVia(mutate = (x) => x) {
+  const fake = async (url) => {
+    const u = new URL(url);
+    const lg = /\/v2\/leagues\/(nfl|cfb)\/events$/.exec(u.pathname)?.[1];
+    const off = Number(u.searchParams.get('offset'));
+    return new Response(JSON.stringify({ events: mutate(clone(PU[lg])).slice(off, off + 100) }), { status: 200 });
+  };
+  return fetchPolyUSInputs({ fetchImpl: fake, now: Date.parse(NOW), retryDelayMs: 0 });
+}
+async function geminiVia(mutate = (x) => x) {
+  const data = mutate(clone(GM.data));
+  const fake = async () => new Response(JSON.stringify({ data, pagination: { limit: 100, offset: 0, total: data.length } }), { status: 200 });
+  return fetchGeminiInputs({ fetchImpl: fake, now: Date.parse(NOW), retryDelayMs: 0 });
+}
+async function sxVia(mutate = (x) => x) {
+  const markets = clone(SX.markets);
+  markets.data.markets = mutate(markets.data.markets);
+  const fake = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === '/markets/active') return new Response(JSON.stringify(markets), { status: 200 });
+    return new Response(JSON.stringify({ status: 'success', data: SX.books[u.searchParams.get('marketHash')] }), { status: 200 });
+  };
+  return fetchSxInputs({ fetchImpl: fake, now: Date.parse('2026-10-12T23:33:00Z'), retryDelayMs: 0 });
+}
+const eachMarket = (events, f) => { for (const e of events) for (const m of e.markets || []) f(m); return events; };
+const geminiEvents = (events, f) => { for (const e of events) { f(e); for (const n of e.events || []) f(n); } return events; };
+
+test('format check: the fetchers count what they saw listed; the saved captures read clean', async () => {
+  const [pu, gm, sx] = await Promise.all([polyusVia(), geminiVia(), sxVia()]);
+  assert.deepEqual(pu.seen, { nfl: 29, cfb: 218 });
+  assert.deepEqual(gm.seen, { nfl: 15, cfb: 61 });
+  assert.ok(sx.seen.nfl >= 15 * 3, JSON.stringify(sx.seen));      // every listed market in the window, any type
+  for (const [v, R] of [['polyus', pu], ['gemini', gm], ['sx', sx]]) assert.deepEqual(venueFormatErrors(v, R), [], v);
+  assert.deepEqual([...VENUES.polyus.markets, '|', ...VENUES.gemini.markets, '|', ...VENUES.sx.markets], ['ml', 'sp', 'tot', '|', 'ml', 'sp', 'tot', '|', 'ml']);
+  assert.equal(DRIFT_MIN, 5);
+});
+
+test('format check: renamed types, statuses or tickers that drop every game set sources.<venue>.ok false', async () => {
+  // Polymarket US renames its winner market type: every game is dropped (it needs the winner market)
+  const pu = await polyusVia((ev) => eachMarket(ev, (m) => { if (m.sportsMarketType === 'football_team_full_game_winner') m.sportsMarketType = 'football_team_full_game_moneyline'; }));
+  assert.deepEqual([pu.leagues.nfl.length, pu.leagues.cfb.length, pu.errors], [0, 0, []]);
+  assert.deepEqual(venueFormatErrors('polyus', pu), ['cfb: 218 polyus listings seen but none could be read (format change?)', 'nfl: 29 polyus listings seen but none could be read (format change?)']);
+  // Gemini changes its event status from 'active' to 'open', or the winner ticker suffix from -M to -ML
+  const gm = await geminiVia((ev) => geminiEvents(ev, (e) => { if (e.status === 'active') e.status = 'open'; }));
+  assert.deepEqual(venueFormatErrors('gemini', gm), ['cfb: 61 gemini listings seen but none could be read (format change?)', 'nfl: 15 gemini listings seen but none could be read (format change?)']);
+  const gm2 = await geminiVia((ev) => geminiEvents(ev, (e) => { if (/-M$/.test(e.ticker)) e.ticker = `${e.ticker}L`; }));
+  assert.equal(venueFormatErrors('gemini', gm2).length, 2);
+  // SX Bet changes its moneyline type id: no book is fetched and no game is kept
+  const sx = await sxVia((ms) => ms.map((m) => (m.type === 226 ? { ...m, type: 1226 } : m)));
+  assert.deepEqual([sx.leagues.nfl.length, sx.requests], [0, 1]);
+  assert.match(venueFormatErrors('sx', sx)[0], /^nfl: \d+ sx listings seen but none could be read \(format change\?\)$/);
+  // through the build: each venue reports ok false with the reason; nothing else changes
+  const ok = buildSnapshot(fullInputs(), { now: RESEARCH_NOW });
+  const at = RESEARCH_NOW.replace(/\.\d{3}Z$/, 'Z');
+  const V = { polyus: { ...pu, fetchedAt: at }, gemini: { ...gm, fetchedAt: at }, sx: { ...sx, fetchedAt: at } };
+  const s = buildSnapshot(fullInputs({ venues: V }), { now: RESEARCH_NOW });
+  assert.deepEqual(validateSnapshot(s), []);
+  for (const v of ['polyus', 'gemini', 'sx']) {
+    assert.equal(s.sources[v].ok, false, v);
+    assert.equal(s.sources[v].matched, 0, v);
+    assert.match(s.sources[v].errors.join(' | '), /listings seen but none could be read \(format change\?\)/, v);
+  }
+  const strip = (x) => x.games.map((g) => { const c = clone(g); if (c.refs) { delete c.refs.venues; if (!Object.keys(c.refs).length) delete c.refs; } return c; });
+  assert.deepEqual(strip(s), strip(ok));
+});
+
+test('format check: a market kind that vanishes (a renamed spread type) sets ok false and keeps the rest', async () => {
+  const pu = await polyusVia((ev) => eachMarket(ev, (m) => { if (m.sportsMarketType === 'football_team_full_game_spread') m.sportsMarketType = 'football_team_full_game_handicap'; }));
+  const kinds = (L) => [...new Set(L.flatMap((g) => Object.keys(g.quotes).map((k) => k.split(':')[0])))].sort();
+  assert.deepEqual([pu.leagues.nfl.length, kinds(pu.leagues.nfl)], [29, ['ml', 'tot']]);
+  assert.deepEqual(venueFormatErrors('polyus', pu), ['cfb: 218 polyus games but no spread quotes (format change?)', 'nfl: 29 polyus games but no spread quotes (format change?)']);
+  const s = buildSnapshot(fullInputs({ venues: { polyus: { ...pu, fetchedAt: RESEARCH_NOW.replace(/\.\d{3}Z$/, 'Z') } } }), { now: RESEARCH_NOW });
+  assert.equal(s.sources.polyus.ok, false);
+  assert.ok(s.sources.polyus.matched > 0, 'the winner and total quotes still vote');
+  assert.ok(s.games.some((g) => g.refs?.venues?.polyus?.quotes?.['ml:home']));
+  // fewer than DRIFT_MIN games is too few to call it a format change
+  const few = { ...pu, leagues: { nfl: pu.leagues.nfl.slice(0, 4) }, seen: { nfl: 4 } };
+  assert.deepEqual(venueFormatErrors('polyus', few), []);
+  // an old saved pull without seen counts is checked on market kinds only
+  assert.deepEqual(venueFormatErrors('polyus', { ...pu, seen: undefined, leagues: { nfl: [] } }), []);
+});
+
+test('format check: a reused Gemini or SX pull keeps its seen counts', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'gd-seen-'));
+  try {
+    const fake = async () => new Response(JSON.stringify({ data: GM.data, pagination: { limit: 100, offset: 0, total: GM.data.length } }), { status: 200 });
+    const t0 = Date.parse(NOW);
+    const a = await fetchGeminiInputs({ fetchImpl: fake, now: t0, stateDir: tmp, retryDelayMs: 0 });
+    const b = await fetchGeminiInputs({ fetchImpl: fake, now: t0 + 5 * 60e3, stateDir: tmp });
+    assert.deepEqual([b.cached, b.seen], [true, a.seen]);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });
