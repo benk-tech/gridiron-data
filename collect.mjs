@@ -160,7 +160,7 @@ async function main() {
       const src = snapshot.sources[v];
       const R = inputs.venues?.[v];
       if (!src || !R) continue;
-      const by = Object.entries(sum.venues[v] || {}).filter(([lg]) => lg in (src.matchedByLeague || {})).sort(([a], [b]) => (a < b ? 1 : -1)).map(([lg, b]) => `${lg} ${b.refs}/${b.pre} pregame games (${b.quotes} quotes)`).join(', ');
+      const by = Object.entries(sum.venues[v] || {}).sort(([a], [b]) => (a < b ? 1 : -1)).map(([lg, b]) => `${lg} ${b.refs}/${b.pre} pregame games (${b.quotes} quotes)`).join(', ');
       const t = inputs.stats.bySource?.[v];
       const um = run.venues?.[v]?.unmatched || [];
       log(`${v}: ${by || 'no games'}; ${R.cached ? `reused the pull from ${R.attemptAt}` : `pulled, ${R.requests} requests`}${t ? ` in ${t.ms} ms` : ''}; unmatched ${um.length}${um.length ? ` (${um.slice(0, 3).join('; ')}${um.length > 3 ? '; ...' : ''})` : ''}`);
