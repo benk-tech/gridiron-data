@@ -1,0 +1,7 @@
+firstDowns,thirdDownEff,fourthDownEff,totalYards,netPassingYards,completionAttempts,yardsPerPass,rushingYards,rushingAttempts,yardsPerRushAttempt,totalPenaltiesYards,turnovers,fumblesLost,interceptions,possessionTime,team_id,team_abbreviation,team_name,home_away,game_id,season
+5,0-9,0-0,162,160,11/19,8.4,2,22,0.1,7-61,1,0,1,21:07,151,ECU,East Carolina Pirates,away,401856634,2026
+27,8-15,1-1,487,260,19/32,8.1,227,49,4.6,6-30,1,1,0,38:53,333,ALA,Alabama Crimson Tide,home,401856634,2026
+27,7-22,4-6,436,333,27/54,6.2,103,45,2.3,5-40,2,1,1,32:32,239,BAY,Baylor Bears,away,401856636,2026
+24,10-18,0-1,389,259,26/35,7.4,130,41,3.2,6-47,3,0,3,27:28,2,AUB,Auburn Tigers,home,401856636,2026
+7,1-10,0-0,153,113,12/24,4.7,40,20,2.0,9-79,1,1,0,18:35,2453,UNA,North Alabama Lions,away,401856635,2026
+29,10-17,1-2,415,267,24/35,7.6,148,49,3.0,8-74,3,2,1,41:25,8,ARK,Arkansas Razorbacks,home,401856635,2026

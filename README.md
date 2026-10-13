@@ -11,8 +11,9 @@ It reads public, unauthenticated endpoints only:
 - Pinnacle's public guest odds feed (`guest.api.arcadia.pinnacle.com/0.1/leagues/{889,880}/matchups` and `/markets/straight`, no key) as a second price source for the game lines. It is unofficial and undocumented, so it is optional: any failure leaves it out of the snapshot and nothing else changes.
 - Reference quotes from three other exchanges for the same game lines, no key: the Polymarket US public gateway (`gateway.polymarket.us/v2/leagues/{nfl,cfb}/events`), Gemini Predictions (`api.gemini.com/v1/prediction-markets/events`) and SX Bet (`api.sx.bet/markets/active` and `/orderbook-v3/snapshot`, an offshore exchange, NFL moneylines only). Only Kalshi is ever bet; these are reference prices (votes) for the site. Each is optional: a failure leaves that venue out and nothing else changes.
 - Kalshi trades before kickoff (`/markets/trades`) for the tracked picks the site asks about, to report the kickoff close.
+- For the site's power ratings, line free data only: the nflverse schedule and results file (`nfldata/data/games.csv`) and four sportsdataverse college files (`cfb_schedules`, `espn_cfb_team_box`, `espn_cfb_adv_team_gamelog`, `cfb_paper_index_games`), plus the nflverse play by play already listed above. See "Rating inputs" below.
 
-Each run turns those responses into one compact JSON snapshot (format v1), gzips it, and sends it to a private site with a signed request. Nothing in this repository computes picks or prices.
+Each run turns those responses into one compact JSON snapshot (format v1), gzips it, and sends it to a private site with a signed request. Nothing in this repository computes picks, prices or ratings, and it holds no fitted model weights.
 
 ## Usage
 
@@ -30,10 +31,10 @@ Options:
 
 | Option | Meaning |
 |---|---|
-| `--cache-dir DIR` | daily data: fee info, nflverse files, depth charts (6 hours), college stats; default `.cache`, `''` for none |
-| `--state-dir DIR` | run-to-run state: `history.json` (DraftKings lines and Kalshi implied centers of the last 48 hours, for line moves), `closes/` (closing lines waiting for their day to end), nflverse check stamps, `pinnacle.json`, `gemini.json` and `sx.json` (the last pull of each, reused for 15 minutes), `clv-closes.json` (Kalshi kickoff closes waiting for their market to settle). Without it every run is a first run. |
+| `--cache-dir DIR` | daily data: fee info, nflverse files, depth charts (6 hours), college stats, the rating input reductions (`ratinginputs/`); default `.cache`, `''` for none |
+| `--state-dir DIR` | run-to-run state: `history.json` (DraftKings lines and Kalshi implied centers of the last 48 hours, for line moves), `closes/` (closing lines waiting for their day to end), nflverse and rating input check stamps, `pinnacle.json`, `gemini.json` and `sx.json` (the last pull of each, reused for 15 minutes), `clv-closes.json` (Kalshi kickoff closes waiting for their market to settle). Without it every run is a first run. |
 | `--closes-dir DIR` | where finished days of closing lines are copied (default `closes/` here) |
-| `--skip LIST` | skip optional parts: `props`, `teamTotals`, `injuries`, `nflverse`, `cfb`, `pinnacle`, `polyus`, `gemini`, `sx` (`--skip-injuries` also works) |
+| `--skip LIST` | skip optional parts: `props`, `teamTotals`, `injuries`, `nflverse`, `cfb`, `pinnacle`, `polyus`, `gemini`, `sx`, `ratinginputs` (`--skip-injuries` also works) |
 | `--kalshi-gap-ms N` | minimum gap between Kalshi requests, default 250 (Kalshi answers HTTP 429 to bursts on `/markets`) |
 | `--save-inputs FILE.json.gz` | keep the raw fetched inputs; `node scripts/build-fixture.mjs FILE.json.gz out.json` rebuilds the same snapshot offline |
 | `--now ISO` | run as if the clock read this time (game window, `generatedAt`, line history, closes); for tests and fixture rebuilds. Request signatures and time budgets always use the real clock. |
@@ -45,9 +46,9 @@ Exit code is 1 when nothing usable came back, when the POST to the site fails, o
 
 A source is also marked down (`ok: false`, with the reason in its errors) when its data arrived but cannot be right: ESPN scoreboard events that cannot be read, a current regular season or postseason week with no games, at least 5 games (and half) of the previous run's upcoming games missing, Kalshi markets or prop rungs with no price at all, no Kalshi game matching any ESPN game, or an injuries feed with nobody on it while NFL games are in the window. The site shows those sources as down instead of an empty slate.
 
-Every run has time budgets, so a host that accepts a connection and then stalls cannot hold the job past its 4 minute timeout: 100 seconds for all fetching, plus a shorter budget for each optional part (Pinnacle 25 s, Gemini and SX Bet 30 s each, team totals 30 s, Polymarket US 40 s, injuries 45 s, props and college data 60 s, nflverse 75 s), all counted from the start of the run, and 30 seconds for the settle handshake. A spent budget stops that part's open requests, sends no new ones, and records `<part> time budget (N s) spent` in its errors; the snapshot is then built and posted with whatever arrived. DraftKings prop line requests use a 10 second timeout and no retry.
+Every run has time budgets, so a host that accepts a connection and then stalls cannot hold the job past its 4 minute timeout: 100 seconds for all fetching, plus a shorter budget for each optional part (Pinnacle 25 s, Gemini and SX Bet 30 s each, team totals 30 s, Polymarket US 40 s, injuries 45 s, props, college data and rating inputs 60 s, nflverse 75 s), all counted from the start of the run, and 30 seconds for the settle handshake. A spent budget stops that part's open requests, sends no new ones, and records `<part> time budget (N s) spent` in its errors; the snapshot is then built and posted with whatever arrived. DraftKings prop line requests use a 10 second timeout and no retry.
 
-A normal 5 minute run sends about 35 requests: Kalshi core, team totals and props (about 25, paced), ESPN scoreboards (4), the injuries feed (1) and DraftKings prop lines (2 per NFL game inside 48 hours). Polymarket US adds 4 requests every run (one page at a time; about 1.7 MB compressed, 65 MB of JSON, parsed page by page). Every third run or so also pulls Pinnacle (4 requests, at most once per 15 minutes, since its CDN caches for 905 seconds anyway), Gemini (1 request, about 7 MB) and SX Bet (1 list request plus about 15 book requests, 2 at a time), and the settle step looks up at most 40 Kalshi kickoff closes per run (about 20 to 60 a week in all). Fee info, depth charts, nflverse and college data come from the cache; nflverse is checked with a HEAD request at most every 30 minutes and downloaded only when its ETag changes. A file that is missing upstream and has no cached copy (the new season's nflverse files from the March 1 rollover until September, or the new college season's file before late August) is asked for again only after 6 hours (30 minutes or 1 hour after other errors), with one HEAD request and no download; until then the source keeps reporting the error.
+A normal 5 minute run sends about 35 requests: Kalshi core, team totals and props (about 25, paced), ESPN scoreboards (4), the injuries feed (1) and DraftKings prop lines (2 per NFL game inside 48 hours). Polymarket US adds 4 requests every run (one page at a time; about 1.7 MB compressed, 65 MB of JSON, parsed page by page). Every third run or so also pulls Pinnacle (4 requests, at most once per 15 minutes, since its CDN caches for 905 seconds anyway), Gemini (1 request, about 7 MB) and SX Bet (1 list request plus about 15 book requests, 2 at a time), and the settle step looks up at most 40 Kalshi kickoff closes per run (about 20 to 60 a week in all). Fee info, depth charts, nflverse and college data come from the cache; nflverse is checked with a HEAD request at most every 30 minutes and downloaded only when its ETag changes; the rating inputs add a HEAD for games.csv at most every 30 minutes and one for each of the four college files at most every 3 hours, each downloaded only on a new ETag. A file that is missing upstream and has no cached copy (the new season's nflverse files from the March 1 rollover until September, or the new college season's file before late August) is asked for again only after 6 hours (30 minutes or 1 hour after other errors), with one HEAD request and no download; until then the source keeps reporting the error.
 
 ## Layout
 
@@ -63,6 +64,7 @@ lib/teamtotals.mjs   Kalshi team-total markets and DraftKings team totals
 lib/injuries.mjs     NFL injuries graded per game from the league feed and depth charts, injury angles
 lib/nflverse.mjs     NFL defense ratings (run, pass, front, secondary) and player stats from nflverse
 lib/cfb.mjs          college defense ratings and the weekly college QB check
+lib/ratinginputs.mjs line free rating inputs (snapshot.ratingInputs): play by play sums, schedules, starters, college box efficiency
 lib/csv.mjs          quote-aware CSV parser
 lib/moves.mjs        line history (DraftKings lines, Kalshi implied centers, Kalshi's folded book) and moves between runs
 lib/pinnacle.mjs     Pinnacle guest feed: pull every 15 minutes, trim, match to ESPN games, refs.pinnacle
@@ -178,6 +180,42 @@ Orientation: the Polymarket US winner market's long side is the away team, and s
 Request budget for the three venues: Polymarket US about 4 GETs every run (one page at a time); Gemini 1 GET (at most 3 pages) and SX Bet 1 list GET plus about 15 order book GETs (2 at a time), each at most once per 15 minutes; so about 10 requests per run on average and never more than about 24 in one run. A 4xx (a block) is never retried; a network error or a 5xx is retried once. These sources are optional, like Pinnacle: the site must list them in its optional sources so a venue being down never raises the "sources are down" banner. Unmatched venue games (mostly FCS) are logged, not stored.
 
 Every endpoint above was checked from a residential IP; GitHub Actions runner IPs are untested.
+
+## Rating inputs (`snapshot.ratingInputs`)
+
+Raw, line free data reductions for the site's own power ratings. The ratings themselves, their fitted weights, priors and every rule that uses them live only in the private site; this part only reshapes public files. On by default; `--skip ratinginputs` leaves both the field and `sources.ratingInputs` out, and the rest of the snapshot is byte for byte the same.
+
+```js
+ratingInputs: {
+  v: 1,
+  nfl: {
+    season, asOf,            // asOf: when the collector built these rows (the later of the pbp reduction and the games.csv download)
+    etag, throughWeek,       // the play by play file's ETag; the last week in it
+    games: [Game],           // every game of the season from games.csv, played and upcoming, in file order
+    teamGames: [{ id, team, pass, rush, plays, drives }],   // per team-game sums: pass/rush = 3 wp buckets x [plays, EPA sum, successes]
+    qbGames: [{ id, team, qb, name, b }],                   // per QB per team-game: b = 3 wp buckets x [dropbacks, EPA sum]
+    starters: [{ team, qb, name, espnId, source, status, replaced, at }],   // projected starting QB per team (next game)
+  },
+  cfb: {
+    season, asOf, files: { etags: { schedules, teamBox, advGamelog, paperIndex } },
+    games: [CfbGame],        // every Division I vs Division I game of the season, in the schedule file's order
+    eff: [{ id, ypp: [home, away], plays: [home, away], sr }],   // FBS involved box efficiency, full precision
+    effMissing,              // finals with an FBS team and no efficiency row yet
+  },
+}
+Game = { id, season, type, week, date, time, weekday, home, away, hs, as, result, total, neutral, homeRest, awayRest, div,
+         roof, surface, temp, wind, homeQb, awayQb, homeQbName, awayQbName, espn, stadium }   // total = points scored
+CfbGame = { id, season, week, st, date, neutral, confGame, h, a, hp, ap, done, hDiv, aDiv, hConf, aConf, hName, hAbbr, aName, aAbbr }
+```
+
+- **NFL play by play.** The nflverse play by play the collector already downloads is reduced once per ETag (about 0.2 s now, about 1 s by January) and the reduction is cached under that ETag. Kept plays: `play_type` pass or run, not deleted, not a no-play, not a two point try, kneel or spike, EPA present. Plays are bucketed by nflverse `wp`, the win probability WITHOUT the line: bucket 0 for 0.10 to 0.90 (or no wp), bucket 1 out to 0.03 or 0.97, bucket 2 beyond. `vegas_wp` is never read. EPA sums are rounded to 4 decimals. Team codes are nflverse franchise codes (LA, WAS, JAX, LV, LAC).
+- **games.csv.** Only the columns listed in `NFL_GAME_COLS` are read; the spread, total and moneyline columns and their odds are skipped by the parser. `roof` stays as nflverse has it (blank for upcoming games at retractable roofs). `homeQb` and `awayQb` are nflverse's starters (the actual one once played).
+- **Starters.** The ESPN depth chart QB1 (charts refreshed every 6 hours), or the next QB on the chart when QB1 is listed Out or Doubtful in the league injuries feed (`source: 'depth_injury'`, with the passed over QB in `replaced`). ESPN ids map to nflverse gsis ids through the roster_weekly bridge; `qb` is null when a new QB is not in it yet. Only teams with an unplayed game get a row. Without the injuries part there are no starters.
+- **College.** The four sportsdataverse files are HEAD checked every 3 hours and downloaded only on a new ETag. A game is final when the schedule says so; until it does, a final on the ESPN scoreboards the run already reads (FBS boards) fills the score, and a final between two known teams that is missing from the file is added. FCS only finals cannot be filled that way yet (the FBS boards do not list them). An efficiency row exists when any of the three box score files has the game, even with only nulls.
+- **Caching.** Only the reductions are cached (`cache/ratinginputs/`), never the raw files; the HEAD stamps and failed-file records live in `state/ratinginputs-checks.json`, so the daily cache changes only when data changes. A file that is missing upstream with nothing cached is asked for again after 6 hours (30 minutes after other errors). A failed HEAD or download keeps the cached copy, with a warning.
+- **Line free by construction.** `lib/schema.mjs` reports any field anywhere inside `ratingInputs` named like a line (spread, total line, moneyline, odds, vegas, betting, matchup line), and the tests check the column lists and a games.csv sample whose line columns hold sentinel values.
+
+`sources.ratingInputs` = `{ ok, fetchedAt, requests, nfl: { games, played, teamGames, qbGames, starters, throughWeek }, cfb: { games, finals, eff, effMissing, espnFilled, espnAdded, nonD1 }, warnings, errors }`. `ok` is true only with both leagues and no error. A league whose core file is missing is left out (`nfl` needs games.csv and the play by play reduction, `cfb` the schedule) and the reason is in `errors`; a crash in the builder leaves the whole field out. Size on 2026-10-13: 653 KB raw, 70 KB gzipped (NFL 20 KB, college 51 KB), growing to about 110 to 120 KB gzipped by the end of the season (the size test builds a synthetic full season: 121 KB).
 
 ## Kickoff closes (settle handshake)
 
