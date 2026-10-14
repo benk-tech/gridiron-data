@@ -220,7 +220,7 @@ CfbGame = { id, season, week, st, date, neutral, confGame, h, a, hp, ap, done, h
 
 ## FCS games and lookahead (`Team.division`, `Game.cls`, `Game.lookahead`)
 
-Two optional parts, on by default in the CLI (`--skip fcs`, `--skip lookahead`). The scheduled workflow runs with `--skip fcs,lookahead` for now: the parts add about 110 to 215 college games to what the site shows, so they are turned on only once the site is ready for them, by deleting that flag in `.github/workflows/collect.yml`.
+Two optional parts, on by default in the CLI (`--skip fcs`, `--skip lookahead`). The scheduled workflow runs with both on (since 2026-10-14). They add about 110 to 215 college games to the snapshot; add `--skip fcs,lookahead` in `.github/workflows/collect.yml` to turn them off.
 
 - **fcs** reads ESPN's FCS boards (`groups=81`: the current week, the next week, and the week after next when lookahead runs too). Kalshi lists FCS vs FCS games in the same `KXNCAAFGAME` series as FBS games; without these boards they matched no ESPN game and were dropped (listed in `unmatched.kalshi`). Now an FCS vs FCS game that Kalshi lists joins the snapshot like any college game, with its Kalshi markets, ESPN's DraftKings line when there is one (the FCS boards showed none 3 to 11 days out), weather and kickoff. Matching: 54 of 54 week 7 FCS games, with one alias (Kalshi "University at Albany" and `ALBY`, ESPN "UAlbany" and `ALB`).
 - **lookahead** carries college games Kalshi lists 9 to 16 days out (Kalshi opens college winner markets about 14 days before kickoff), with `lookahead: true` and their winner markets only. It reads the FBS board of the week after next and asks Kalshi for winner markets closing up to 19 days out (16 days of kickoffs, 48 hours to close, a day of slack).
