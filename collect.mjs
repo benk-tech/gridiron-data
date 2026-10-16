@@ -23,6 +23,8 @@
 //                      snapshot byte for byte as it was before those parts existed.
 //   --skip-injuries    same as --skip injuries
 //   --kalshi-gap-ms N  minimum gap between Kalshi requests (default 250; Kalshi answers 429 to bursts on /markets)
+//   --polyus-details N at most N Polymarket US event detail GETs this run (default 100; 0 = winner quotes only, and
+//                      the spread and total format check then reports them missing)
 //   --save-inputs FILE.json.gz   raw fetched inputs (rebuild offline with scripts/build-fixture.mjs)
 //   --now ISO          run as if the clock read ISO (game window, generatedAt, history and closes times). For tests and
 //                      fixture rebuilds; request signatures and time budgets always use the real clock.
@@ -61,7 +63,7 @@ function version() {
   try { return `${JSON.parse(readFileSync(resolve(HERE, 'package.json'), 'utf8')).version}-local`; } catch { return 'local'; }
 }
 
-const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb,pinnacle,polyus,gemini,sx,ratinginputs,fcs,lookahead] [--skip-injuries] [--kalshi-gap-ms N] [--save-inputs FILE.json.gz] [--now ISO] [--quiet]';
+const USAGE = 'usage: node collect.mjs [--out file.json] [--post] [--settle] [--cache-dir DIR] [--state-dir DIR] [--closes-dir DIR] [--skip props,teamTotals,injuries,nflverse,cfb,pinnacle,polyus,gemini,sx,ratinginputs,fcs,lookahead] [--skip-injuries] [--kalshi-gap-ms N] [--polyus-details N] [--save-inputs FILE.json.gz] [--now ISO] [--quiet]';
 
 async function main() {
   let args;
@@ -76,6 +78,7 @@ async function main() {
         'closes-dir': { type: 'string' },
         skip: { type: 'string', default: '' },
         'kalshi-gap-ms': { type: 'string' },
+        'polyus-details': { type: 'string' },
         'skip-injuries': { type: 'boolean', default: false },
         'save-inputs': { type: 'string' },
         now: { type: 'string' },
@@ -97,6 +100,14 @@ async function main() {
   if (unknown.length) {
     console.error(`unknown --skip part(s): ${unknown.join(', ')} (known: ${PART_KEYS.join(', ')})\n${USAGE}`);
     return 2;
+  }
+  let polyusDetails = null;
+  if (args['polyus-details'] != null) {
+    polyusDetails = /^\d+$/.test(args['polyus-details']) ? Number(args['polyus-details']) : NaN;
+    if (!Number.isSafeInteger(polyusDetails)) {
+      console.error(`bad --polyus-details value (want a whole number such as 100, or 0 for none)\n${USAGE}`);
+      return 2;
+    }
   }
   const startMs = Date.now(); // real clock: timings and time budgets
   let t0 = startMs; // the run's 'now': game window, generatedAt, history and closes
@@ -129,6 +140,7 @@ async function main() {
       stateDir,
       parts: Object.fromEntries(PART_KEYS.map((k) => [k, !skip.has(k)])),
       pacer,
+      ...(polyusDetails != null ? { venueOpts: { polyus: { maxDetails: polyusDetails } } } : {}),
       log,
     });
     const fetchMs = Date.now() - startMs;

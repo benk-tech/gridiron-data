@@ -7,6 +7,8 @@
 //   with its Last-Modified headers) | 'block' (HTTP 403, as a block of the runner's IP would look)
 // FAKE_VENUES: unset (default: the venue hosts answer 404 like any unknown host) | 'ok' (the saved Polymarket US,
 //   Gemini and SX Bet captures in test/fixtures/venues) | 'block' (HTTP 403) | per venue, e.g. 'polyus=ok,gemini=block,sx=ok'
+//   | 'polyus=new' (the Polymarket US format since 2026-10-15: the 2026-10-16 list pages with winner markets only and
+//   its 16 event details at /v1/events/slug/{slug}; any other event detail answers 404)
 // FAKE_FCS: unset (default: groups=81 college boards answer with an empty events list, the week boards as before) |
 //   'ok' (the 2026-10-13 captures in test/fixtures/fcs: groups=81 default = week 7, groups=81 and groups=80 week 8;
 //   any other week board an empty list)
@@ -30,6 +32,8 @@ const PIN_LEAGUE = { 889: 'nfl', 880: 'cfb' };
 const venueEnv = process.env.FAKE_VENUES || '';
 const venueMode = (v) => (venueEnv.includes('=') ? (Object.fromEntries(venueEnv.split(',').map((x) => x.split('=')))[v] || '') : venueEnv);
 const VEN = venueEnv ? { polyus: gz('venues', 'polyus-20261012.json.gz'), gemini: gz('venues', 'gemini-20261013.json.gz'), sx: gz('venues', 'sx-20261012.json.gz') } : null;
+const PU_NEW = venueEnv && venueMode('polyus') === 'new' ? gz('venues', 'polyus-20261016.json.gz') : null;
+const PU_NEW_DETAILS = new Map((PU_NEW?.details || []).map((d) => [d.slug, d]));
 const VENUE_HOST = { 'gateway.polymarket.us': 'polyus', 'api.gemini.com': 'gemini', 'api.sx.bet': 'sx' };
 const fcsMode = process.env.FAKE_FCS || '';
 const FCS_BOARDS = fcsMode === 'ok' ? {
@@ -52,6 +56,11 @@ function venueAnswer(v, url) {
   const off = Number(url.searchParams.get('offset') || 0), lim = Number(url.searchParams.get('limit') || 100);
   if (v === 'polyus') {
     const lg = /^\/v2\/leagues\/(nfl|cfb)\/events$/.exec(url.pathname)?.[1];
+    if (m === 'new') {
+      if (lg) return json(JSON.stringify({ events: PU_NEW.list[lg].slice(off, off + lim) }));
+      const d = PU_NEW_DETAILS.get(/^\/v1\/events\/slug\/(.+)$/.exec(url.pathname)?.[1]);
+      return d ? json(JSON.stringify({ event: d })) : json('{"code":5,"message":"not found"}', 404);
+    }
     return lg ? json(JSON.stringify({ events: VEN.polyus[lg].slice(off, off + lim) })) : json('{}', 404);
   }
   if (v === 'gemini') {
