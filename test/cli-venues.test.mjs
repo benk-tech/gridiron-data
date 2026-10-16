@@ -121,16 +121,16 @@ test('collect.mjs: --polyus-details caps the Polymarket US event details (the fo
   const tmp = mkdtempSync(join(tmpdir(), 'gd-cli-pud-'));
   try {
     const common = ['--cache-dir', join(tmp, 'cache'), '--closes-dir', join(tmp, 'closes'), '--skip', 'props,teamTotals,nflverse,cfb,injuries,pinnacle,gemini,sx,ratinginputs,fcs,lookahead', '--now', '2026-10-16T07:05:26Z'];
-    // the 2026-10-16 lists and 16 details: 2 details asked for, 72 of the 74 wanted left for the cap
+    // the 2026-10-16 lists and 16 details: 2 details asked for, 80 of the 82 wanted left for the cap
     const a = await run(['--out', join(tmp, 'a.json'), ...common, '--polyus-details', '2'], { FAKE_VENUES: 'polyus=new' });
     assert.equal(a.code, 0, a.out);
-    assert.match(a.out, /^polyus: 6 requests \(4 list, 2 event details for 74 games, 72 over the cap of 2\), [\d.]+ MB$/m);
+    assert.match(a.out, /^polyus: 6 requests \(4 list, 2 event details for 82 games, 80 over the cap of 2\), [\d.]+ MB$/m);
     assert.match(a.out, /^ {2}polyus +6 req +\d+ ms$/m);
     assert.equal(JSON.parse(readFileSync(join(tmp, 'a.json'), 'utf8')).sources.polyus.requests, 6);
-    // the default cap: every wanted game (the 58 details the fixture lacks answer 404, so the source is not ok)
+    // the default cap: every wanted game (the 66 details the fixture lacks answer 404, so the source is not ok)
     const b = await run(['--out', join(tmp, 'b.json'), ...common], { FAKE_VENUES: 'polyus=new' });
     assert.equal(b.code, 0, b.out);
-    assert.match(b.out, /^polyus: 78 requests \(4 list, 74 event details for 74 games\)/m);
+    assert.match(b.out, /^polyus: 86 requests \(4 list, 82 event details for 82 games\)/m);
     assert.match(b.out, /source polyus: NOT OK {2}cfb cfb-[a-z0-9-]+: gateway\.polymarket\.us\/v1\/events\/slug\/cfb-[a-z0-9-]+: HTTP 404/);
   } finally {
     rmSync(tmp, { recursive: true, force: true });

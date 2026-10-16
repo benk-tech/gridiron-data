@@ -13,7 +13,7 @@ import { FIX } from './helpers.mjs';
 import { parsePolyUS, fetchPolyUSInputs, planDetails, detailKickoff, POLYUS_BASE, POLYUS_MAX_DETAILS, POLYUS_DETAIL_AHEAD_MS } from '../lib/venues/polyus.mjs';
 import { buildVenue, venueFormatErrors } from '../lib/venues/index.mjs';
 import { Q, flipQ, reorient } from '../lib/venues/common.mjs';
-import { buildSnapshot } from '../lib/build.mjs';
+import { buildSnapshot, WINDOW } from '../lib/build.mjs';
 import { validateSnapshot } from '../lib/schema.mjs';
 
 const gz = (...p) => JSON.parse(gunzipSync(readFileSync(join(FIX, ...p))).toString('utf8'));
@@ -153,7 +153,7 @@ test('fetchPolyUSInputs on the new format: 4 list GETs, then one detail per game
   assert.deepEqual(calls.slice(0, 4), listUrls);
   assert.deepEqual(calls.slice(4), PLANNED.map((s) => `${POLYUS_BASE}/v1/events/slug/${s}`));
   assert.deepEqual([r.fetchedAt, r.errors, r.seen], ['2026-10-16T07:05:26Z', [], { nfl: 28, cfb: 218 }]);
-  assert.deepEqual(r.details, { nfl: { wanted: 14, pulled: 8 }, cfb: { wanted: 60, pulled: 8 } });
+  assert.deepEqual(r.details, { nfl: { wanted: 14, pulled: 8 }, cfb: { wanted: 68, pulled: 8 } });
   assert.deepEqual([kinds(r.leagues.nfl), kinds(r.leagues.cfb)], [{ ml: 27, sp: 324, tot: 229 }, { ml: 172, sp: 287, tot: 181 }]);
   assert.deepEqual(venueFormatErrors('polyus', r), []);
   // a game with a detail: the detail's quotes (its winner too, read seconds after the list); the others: the list's winner
@@ -163,25 +163,26 @@ test('fetchPolyUSInputs on the new format: 4 list GETs, then one detail per game
   assert.deepEqual(cp.quotes, parsePolyUS([NEW.details.find((d) => d.slug === cp.id)])[0].quotes);
   assert.deepEqual(r.leagues.nfl.map((g) => g.id), parsePolyUS(NEW.list.nfl).map((g) => g.id), 'the list order is kept');
 
-  // the games that want a detail: open, lines counted, kicking off after now and within 7 days
+  // the games that want a detail: open, lines counted, kicking off after now and inside the snapshot window (9 days)
   const now = Date.parse(NOW);
   const wanted = NEW.list.nfl.filter((e) => detailKickoff(e, now) != null);
   assert.equal(wanted.length, 14);
   assert.ok(wanted.every((e) => Date.parse(e.startTime) > now && Date.parse(e.startTime) <= now + POLYUS_DETAIL_AHEAD_MS));
   assert.ok(NEW.list.nfl.filter((e) => !wanted.includes(e)).every((e) => !(e.marketCounts.numSpreadsAndTotalsMarkets > 0) || Date.parse(e.startTime) > now + POLYUS_DETAIL_AHEAD_MS), 'the rest: no lines, or next week');
+  assert.equal(POLYUS_DETAIL_AHEAD_MS, WINDOW.aheadMs, 'the snapshot window');
   assert.equal(detailKickoff(OLD.nfl[0], Date.parse(OLD.fetchedAt)), null, 'an old list event carries its lines: no detail');
   assert.equal(detailKickoff({ ...NEW.list.nfl[0], closed: true }, now), null);
   assert.equal(detailKickoff(NEW.list.nfl[0], Date.parse(NEW.list.nfl[0].startTime)), null, 'started: no detail');
 });
 
 test('fetchPolyUSInputs: the default cap reads every wanted game; the merge does not depend on which answer came first', async () => {
-  // default cap (100): 74 details; the 58 not in the fixture answer 404 and those games keep their winner quote
+  // default cap (100): 82 details; the 66 not in the fixture answer 404 and those games keep their winner quote
   const calls = [];
   const all = await via({ calls }, { maxDetails: undefined });
   assert.equal(POLYUS_MAX_DETAILS, 100);
-  assert.equal(all.requests, 78);
-  assert.equal(new Set(calls).size, 78, 'one GET each');
-  assert.equal(all.errors.length, 58);
+  assert.equal(all.requests, 86);
+  assert.equal(new Set(calls).size, 86, 'one GET each');
+  assert.equal(all.errors.length, 66);
   assert.match(all.errors[0], /^cfb cfb-[a-z0-9-]+: gateway\.polymarket\.us\/v1\/events\/slug\/cfb-[a-z0-9-]+: HTTP 404$/);
   assert.deepEqual(all.errors, [...all.errors].sort(), 'sorted');
   assert.deepEqual(all.leagues, (await via()).leagues);
@@ -221,7 +222,7 @@ test('fetchPolyUSInputs: a failed detail keeps the winner; a 403 stops the rest;
   assert.deepEqual(e.errors, ['cfb cfb-clmb-penn-2026-10-16: expected an event with markets (format change?)', 'nfl nfl-hou-jax-2026-10-18: expected an event with markets (format change?)']);
   // --polyus-details 0: the list only (4 GETs); the spread and total check reports the lines missing
   const z = await via({}, { maxDetails: 0 });
-  assert.deepEqual([z.requests, z.errors, z.details], [4, [], { nfl: { wanted: 14, pulled: 0 }, cfb: { wanted: 60, pulled: 0 } }]);
+  assert.deepEqual([z.requests, z.errors, z.details], [4, [], { nfl: { wanted: 14, pulled: 0 }, cfb: { wanted: 68, pulled: 0 } }]);
   assert.equal(venueFormatErrors('polyus', z).length, 4);
 });
 
