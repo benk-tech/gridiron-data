@@ -1,6 +1,6 @@
 // End to end through collect.mjs (saved captures in place of the APIs): the exchange reference venues are pulled on
-// their own cadence (Polymarket US every run, Gemini and SX Bet every 15 minutes from the state dir), logged with
-// their timings and request counts, and fail open: blocked or skipped venues leave the rest of the snapshot as it was.
+// their cadence (each at most every 15 minutes, reused from the state dir in between), logged with their timings and
+// request counts, and fail open: blocked or skipped venues leave the rest of the snapshot as it was.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -54,23 +54,24 @@ test('collect.mjs: venues pulled on their cadence, logged, reused from state; bl
     assert.deepEqual(validateSnapshot(s1), []);
     assert.deepEqual([s1.sources.polyus.matched, s1.sources.gemini.matched, s1.sources.sx.matched], [75, 52, 14]);
     assert.deepEqual([s1.collector.timings.polyus.requests, s1.collector.timings.gemini.requests, s1.collector.timings.sx.requests], [4, 1, 16]);
-    assert.ok(existsSync(join(tmp, 'state', 'gemini.json')) && existsSync(join(tmp, 'state', 'sx.json')));
-    assert.ok(!existsSync(join(tmp, 'state', 'polyus.json')), 'Polymarket US keeps no copy: pulled every run');
+    for (const v of ['polyus', 'gemini', 'sx']) assert.ok(existsSync(join(tmp, 'state', `${v}.json`)), `state/${v}.json keeps the pull`);
 
-    // 5 minutes later: Polymarket US pulled again, Gemini and SX reused (fetchedAt stays the time of their pull)
+    // 5 minutes later: every venue reused, Polymarket US too (no requests; fetchedAt stays the time of the pull)
     const r2 = await run(['--out', join(tmp, 's2.json'), ...common, '--now', at(5)], { FAKE_VENUES: 'ok' });
     assert.equal(r2.code, 0, r2.out);
-    assert.match(r2.out, /polyus: .*; pulled, 4 requests/);
-    assert.match(r2.out, /gemini: .*; reused the pull from 2026-10-11T22:51:00Z/);
-    assert.match(r2.out, /sx: .*; reused the pull from 2026-10-11T22:51:00Z/);
+    for (const v of ['polyus', 'gemini', 'sx']) assert.match(r2.out, new RegExp(`${v}: .*; reused the pull from 2026-10-11T22:51:00Z`));
+    assert.doesNotMatch(r2.out, /polyus: .*; pulled/);
     const s2 = snap(2);
-    assert.deepEqual([s2.sources.gemini.cached, s2.sources.sx.cached, s2.sources.polyus.cached], [true, true, false]);
-    assert.deepEqual([s2.collector.timings.gemini.requests, s2.collector.timings.sx.requests], [0, 0]);
-    assert.equal(s2.sources.polyus.fetchedAt, at(5));
+    assert.deepEqual([s2.sources.gemini.cached, s2.sources.sx.cached, s2.sources.polyus.cached], [true, true, true]);
+    assert.deepEqual([s2.collector.timings.gemini.requests, s2.collector.timings.sx.requests, s2.collector.timings.polyus.requests], [0, 0, 0]);
+    assert.equal(s2.sources.polyus.fetchedAt, at(0));
     assert.equal(s2.sources.gemini.fetchedAt, at(0));
+    assert.deepEqual([s2.sources.polyus.ok, s2.sources.polyus.matched], [true, 75], 'the reused pull still votes');
     const g2 = s2.games.find((g) => g.refs?.venues?.sx);
     assert.equal(g2.refs.venues.sx.fetchedAt, at(0));
-    assert.equal(g2.refs.venues.polyus.fetchedAt, at(5));
+    assert.equal(g2.refs.venues.polyus.fetchedAt, at(0));
+    const polyRefs = (s) => s.games.map((g) => g.refs?.venues?.polyus ?? null);
+    assert.deepEqual(polyRefs(s2), polyRefs(s1), 'the same Polymarket US blocks as the pull');
     // Kalshi's book from the previous run: none on the first run (no history), on every game with venue quotes from
     // the second run on, stamped with that run's time
     assert.ok(s1.games.every((g) => g.kalshi.prevQuotes === undefined && g.kalshi.prevAt === undefined), 'first run: no previous book');
@@ -121,16 +122,19 @@ test('collect.mjs: --polyus-details caps the Polymarket US event details (the fo
   const tmp = mkdtempSync(join(tmpdir(), 'gd-cli-pud-'));
   try {
     const common = ['--cache-dir', join(tmp, 'cache'), '--closes-dir', join(tmp, 'closes'), '--skip', 'props,teamTotals,nflverse,cfb,injuries,pinnacle,gemini,sx,ratinginputs,fcs,lookahead', '--now', '2026-10-16T07:05:26Z'];
-    // the 2026-10-16 lists and 16 details: 2 details asked for, 80 of the 82 wanted left for the cap
+    // the 2026-10-16 lists and 16 details: 56 college games kick off within 48 hours (no NFL game does), 2 details
+    // asked for, 54 left for the cap; the NFL games keep their winner quotes and that is no format error
     const a = await run(['--out', join(tmp, 'a.json'), ...common, '--polyus-details', '2'], { FAKE_VENUES: 'polyus=new' });
     assert.equal(a.code, 0, a.out);
-    assert.match(a.out, /^polyus: 6 requests \(4 list, 2 event details for 82 games, 80 over the cap of 2\), [\d.]+ MB$/m);
+    assert.match(a.out, /^polyus: 6 requests \(4 list, 2 event details for 56 games, 54 over the cap of 2\), [\d.]+ MB$/m);
+    assert.match(a.out, /^source polyus: ok$/m);
     assert.match(a.out, /^ {2}polyus +6 req +\d+ ms$/m);
     assert.equal(JSON.parse(readFileSync(join(tmp, 'a.json'), 'utf8')).sources.polyus.requests, 6);
-    // the default cap: every wanted game (the 66 details the fixture lacks answer 404, so the source is not ok)
+    // the default cap of 40, nearest first (32 of those details are not in the fixture and answer 404, so the source
+    // is not ok)
     const b = await run(['--out', join(tmp, 'b.json'), ...common], { FAKE_VENUES: 'polyus=new' });
     assert.equal(b.code, 0, b.out);
-    assert.match(b.out, /^polyus: 86 requests \(4 list, 82 event details for 82 games\)/m);
+    assert.match(b.out, /^polyus: 44 requests \(4 list, 40 event details for 56 games, 16 over the cap of 40\)/m);
     assert.match(b.out, /source polyus: NOT OK {2}cfb cfb-[a-z0-9-]+: gateway\.polymarket\.us\/v1\/events\/slug\/cfb-[a-z0-9-]+: HTTP 404/);
   } finally {
     rmSync(tmp, { recursive: true, force: true });

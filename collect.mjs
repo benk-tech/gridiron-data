@@ -13,8 +13,8 @@
 // Options:
 //   --cache-dir DIR    daily data (fees, nflverse, depth charts, CFB, rating input reductions), default .cache; '' = no cache
 //   --state-dir DIR    run-to-run state: history.json (line moves, last 48 h), closes/ (staged closes), nflverse
-//                      and rating input check stamps, pinnacle.json, gemini.json, sx.json and espn-extra.json (the FCS
-//                      and lookahead boards) (last pulls, each reused for 15 min),
+//                      and rating input check stamps, pinnacle.json, polyus.json, gemini.json, sx.json and
+//                      espn-extra.json (the FCS and lookahead boards) (last pulls, each reused for 15 min),
 //                      clv-closes.json (Kalshi kickoff closes waiting for their settlement). Without it every run is a
 //                      first run.
 //   --closes-dir DIR   where finished ET days of closes are copied (default: closes/ next to this file); only with --state-dir
@@ -23,8 +23,9 @@
 //                      snapshot byte for byte as it was before those parts existed.
 //   --skip-injuries    same as --skip injuries
 //   --kalshi-gap-ms N  minimum gap between Kalshi requests (default 250; Kalshi answers 429 to bursts on /markets)
-//   --polyus-details N at most N Polymarket US event detail GETs this run (default 100; 0 = winner quotes only, and
-//                      the spread and total format check then reports them missing)
+//   --polyus-details N at most N Polymarket US event detail GETs per pull (default 40, nearest kickoff first, games
+//                      within 48 hours only; 0 = winner quotes only). A run that reuses the last pull
+//                      (state/polyus.json) sends none.
 //   --save-inputs FILE.json.gz   raw fetched inputs (rebuild offline with scripts/build-fixture.mjs)
 //   --now ISO          run as if the clock read ISO (game window, generatedAt, history and closes times). For tests and
 //                      fixture rebuilds; request signatures and time budgets always use the real clock.
@@ -105,7 +106,7 @@ async function main() {
   if (args['polyus-details'] != null) {
     polyusDetails = /^\d+$/.test(args['polyus-details']) ? Number(args['polyus-details']) : NaN;
     if (!Number.isSafeInteger(polyusDetails)) {
-      console.error(`bad --polyus-details value (want a whole number such as 100, or 0 for none)\n${USAGE}`);
+      console.error(`bad --polyus-details value (want a whole number such as 40, or 0 for none)\n${USAGE}`);
       return 2;
     }
   }

@@ -4,16 +4,19 @@
 // (scripts/make-polyus-fixtures.mjs): the 4 list pages, 16 event details (8 NFL, 8 college), and that run's ESPN
 // boards and Kalshi books. The format before (the lines inside the list) is polyus-20261012.json.gz, read in
 // test/venues.test.mjs.
+// To be polite to the gateway the fetcher now pulls at most every 15 minutes (state/polyus.json), asks for details
+// only for games kicking off within 48 hours, nearest first, and at most 40 per pull; the last tests cover that.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { gunzipSync } from 'node:zlib';
 import { join } from 'node:path';
 import { FIX } from './helpers.mjs';
-import { parsePolyUS, fetchPolyUSInputs, planDetails, detailKickoff, POLYUS_BASE, POLYUS_MAX_DETAILS, POLYUS_DETAIL_AHEAD_MS } from '../lib/venues/polyus.mjs';
+import { parsePolyUS, fetchPolyUSInputs, planDetails, detailKickoff, POLYUS_BASE, POLYUS_MAX_DETAILS, POLYUS_DETAIL_AHEAD_MS, POLYUS_MIN_INTERVAL_MS } from '../lib/venues/polyus.mjs';
 import { buildVenue, venueFormatErrors } from '../lib/venues/index.mjs';
 import { Q, flipQ, reorient } from '../lib/venues/common.mjs';
-import { buildSnapshot, WINDOW } from '../lib/build.mjs';
+import { buildSnapshot } from '../lib/build.mjs';
 import { validateSnapshot } from '../lib/schema.mjs';
 
 const gz = (...p) => JSON.parse(gunzipSync(readFileSync(join(FIX, ...p))).toString('utf8'));
@@ -34,24 +37,43 @@ const listUrls = [
   `${POLYUS_BASE}/v2/leagues/cfb/events?limit=100&offset=100`,
   `${POLYUS_BASE}/v2/leagues/cfb/events?limit=100&offset=200`,
 ];
-// The 16 details of the run, in the order they were asked for: the leagues take turns, each by kickoff then slug.
+const DAY = 86400e3, HOUR = 3600e3;
+const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+// The run asked for 16 details (8 NFL, 8 college), up to 9 days out, when the planner still took the leagues in
+// turns. So that the detail format tests below read exactly those 16 with today's planner, they use REACH (that 9 day
+// reach) and the RECORDED lists: every game whose detail the fixture lacks is listed without spreads or totals
+// (marketCounts 0), so it wants no detail. The cap, window and cadence tests at the end use the lists as served.
+const REACH = 9 * DAY;
+const RECORDED_SLUGS = new Set(NEW.details.map((d) => d.slug));
+const recordedList = (lg) => NEW.list[lg].map((e) => (RECORDED_SLUGS.has(e.slug) ? e : { ...e, marketCounts: { ...e.marketCounts, numSpreadsAndTotalsMarkets: 0 } }));
+// The 16 details in the order today's planner asks for them: nearest kickoff first, a tie by league (NFL first)
+// then slug, so the college games of Friday and Saturday come before the NFL games of Sunday.
 const PLANNED = [
-  'nfl-hou-jax-2026-10-18', 'cfb-clmb-penn-2026-10-16', 'nfl-bal-cle-2026-10-18', 'cfb-mphs-tulane-2026-10-16',
-  'nfl-car-phi-2026-10-18', 'cfb-applst-coast-2026-10-16', 'nfl-chi-atl-2026-10-18', 'cfb-wash-pur-2026-10-16',
-  'nfl-no-nyg-2026-10-18', 'cfb-ballst-bowlgr-2026-10-17', 'nfl-nyj-ne-2026-10-18', 'cfb-chsou-clmsn-2026-10-17',
-  'nfl-pit-tb-2026-10-18', 'cfb-cin-wvir-2026-10-17', 'nfl-ten-ind-2026-10-18', 'cfb-fl-tx-2026-10-17',
+  'cfb-clmb-penn-2026-10-16', 'cfb-mphs-tulane-2026-10-16', 'cfb-applst-coast-2026-10-16', 'cfb-wash-pur-2026-10-16',
+  'cfb-ballst-bowlgr-2026-10-17', 'cfb-chsou-clmsn-2026-10-17', 'cfb-cin-wvir-2026-10-17', 'cfb-fl-tx-2026-10-17',
+  'nfl-hou-jax-2026-10-18', 'nfl-bal-cle-2026-10-18', 'nfl-car-phi-2026-10-18', 'nfl-chi-atl-2026-10-18',
+  'nfl-no-nyg-2026-10-18', 'nfl-nyj-ne-2026-10-18', 'nfl-pit-tb-2026-10-18', 'nfl-ten-ind-2026-10-18',
 ];
+// The games of the lists as served that want a detail at a clock, nearest first: open, lines counted, kicking off
+// after the clock and within 48 hours of it (worked out here from the raw lists, not with the fetcher's code).
+const servedWanted = (clockMs) => ['nfl', 'cfb'].flatMap((lg) => NEW.list[lg]
+  .filter((e) => !e.closed && !e.archived && e.marketCounts.numSpreadsAndTotalsMarkets > 0)
+  .map((e) => ({ league: lg, slug: e.slug, t: Date.parse(e.startTime) }))
+  .filter((x) => x.t > clockMs && x.t <= clockMs + 48 * HOUR))
+  .sort((a, b) => a.t - b.t || (a.league === b.league ? 0 : a.league === 'nfl' ? -1 : 1) || (a.slug < b.slug ? -1 : 1));
 
-// The gateway of that run: the list pages, the 16 details by slug (any other detail 404), status overrides by slug.
-function gateway({ details = NEW.details, status = {}, delay = null, calls = [] } = {}) {
+// The gateway of that run: the list pages (RECORDED unless served: true), the 16 details by slug (any other detail
+// 404), status overrides by slug.
+function gateway({ details = NEW.details, status = {}, delay = null, calls = [], served = false } = {}) {
   const bySlug = new Map(details.map((d) => [d.slug, d]));
+  const lists = { nfl: served ? NEW.list.nfl : recordedList('nfl'), cfb: served ? NEW.list.cfb : recordedList('cfb') };
   return async (url) => {
     calls.push(url);
     const u = new URL(url);
     const lg = /^\/v2\/leagues\/(nfl|cfb)\/events$/.exec(u.pathname)?.[1];
     if (lg) {
       const off = Number(u.searchParams.get('offset'));
-      return new Response(JSON.stringify({ events: NEW.list[lg].slice(off, off + 100) }), { status: 200 });
+      return new Response(JSON.stringify({ events: lists[lg].slice(off, off + 100) }), { status: 200 });
     }
     const slug = /^\/v1\/events\/slug\/(.+)$/.exec(u.pathname)?.[1];
     if (delay) await new Promise((r) => setTimeout(r, delay(slug)));
@@ -60,7 +82,7 @@ function gateway({ details = NEW.details, status = {}, delay = null, calls = [] 
     return new Response('{"code":5,"message":"not found"}', { status: 404 });
   };
 }
-const via = (g = {}, opts = {}) => fetchPolyUSInputs({ fetchImpl: gateway(g), now: Date.parse(NOW), retryDelayMs: 0, maxDetails: 16, ...opts });
+const via = (g = {}, opts = {}) => fetchPolyUSInputs({ fetchImpl: gateway(g), now: Date.parse(NOW), retryDelayMs: 0, aheadMs: REACH, ...opts });
 
 // Kalshi books of the run in canonical keys (the two winner markets folded), as in test/venues.test.mjs.
 function kalshiQuotes(markets) {
@@ -146,14 +168,14 @@ test('what did not change: the detail carries the full game lines in the old mar
 
 // ---------------------------------------------------------------- the fetcher
 
-test('fetchPolyUSInputs on the new format: 4 list GETs, then one detail per game with lines, the leagues taking turns by kickoff', async () => {
+test('fetchPolyUSInputs on the new format: 4 list GETs, then one detail per game with lines, nearest kickoff first', async () => {
   const calls = [];
   const r = await via({ calls });
   assert.equal(r.requests, 20);
   assert.deepEqual(calls.slice(0, 4), listUrls);
   assert.deepEqual(calls.slice(4), PLANNED.map((s) => `${POLYUS_BASE}/v1/events/slug/${s}`));
-  assert.deepEqual([r.fetchedAt, r.errors, r.seen], ['2026-10-16T07:05:26Z', [], { nfl: 28, cfb: 218 }]);
-  assert.deepEqual(r.details, { nfl: { wanted: 14, pulled: 8 }, cfb: { wanted: 68, pulled: 8 } });
+  assert.deepEqual([r.fetchedAt, r.cached, r.errors, r.seen], ['2026-10-16T07:05:26Z', false, [], { nfl: 28, cfb: 218 }]);
+  assert.deepEqual(r.details, { nfl: { wanted: 8, pulled: 8, read: 8 }, cfb: { wanted: 8, pulled: 8, read: 8 } });
   assert.deepEqual([kinds(r.leagues.nfl), kinds(r.leagues.cfb)], [{ ml: 27, sp: 324, tot: 229 }, { ml: 172, sp: 287, tot: 181 }]);
   assert.deepEqual(venueFormatErrors('polyus', r), []);
   // a game with a detail: the detail's quotes (its winner too, read seconds after the list); the others: the list's winner
@@ -163,67 +185,47 @@ test('fetchPolyUSInputs on the new format: 4 list GETs, then one detail per game
   assert.deepEqual(cp.quotes, parsePolyUS([NEW.details.find((d) => d.slug === cp.id)])[0].quotes);
   assert.deepEqual(r.leagues.nfl.map((g) => g.id), parsePolyUS(NEW.list.nfl).map((g) => g.id), 'the list order is kept');
 
-  // the games that want a detail: open, lines counted, kicking off after now and inside the snapshot window (9 days)
+  // the games that want a detail: open, lines counted, kicking off after now and within the reach
   const now = Date.parse(NOW);
-  const wanted = NEW.list.nfl.filter((e) => detailKickoff(e, now) != null);
-  assert.equal(wanted.length, 14);
-  assert.ok(wanted.every((e) => Date.parse(e.startTime) > now && Date.parse(e.startTime) <= now + POLYUS_DETAIL_AHEAD_MS));
-  assert.ok(NEW.list.nfl.filter((e) => !wanted.includes(e)).every((e) => !(e.marketCounts.numSpreadsAndTotalsMarkets > 0) || Date.parse(e.startTime) > now + POLYUS_DETAIL_AHEAD_MS), 'the rest: no lines, or next week');
-  assert.equal(POLYUS_DETAIL_AHEAD_MS, WINDOW.aheadMs, 'the snapshot window');
   assert.equal(detailKickoff(OLD.nfl[0], Date.parse(OLD.fetchedAt)), null, 'an old list event carries its lines: no detail');
-  assert.equal(detailKickoff({ ...NEW.list.nfl[0], closed: true }, now), null);
-  assert.equal(detailKickoff(NEW.list.nfl[0], Date.parse(NEW.list.nfl[0].startTime)), null, 'started: no detail');
-});
-
-test('fetchPolyUSInputs: the default cap reads every wanted game; the merge does not depend on which answer came first', async () => {
-  // default cap (100): 82 details; the 66 not in the fixture answer 404 and those games keep their winner quote
-  const calls = [];
-  const all = await via({ calls }, { maxDetails: undefined });
-  assert.equal(POLYUS_MAX_DETAILS, 100);
-  assert.equal(all.requests, 86);
-  assert.equal(new Set(calls).size, 86, 'one GET each');
-  assert.equal(all.errors.length, 66);
-  assert.match(all.errors[0], /^cfb cfb-[a-z0-9-]+: gateway\.polymarket\.us\/v1\/events\/slug\/cfb-[a-z0-9-]+: HTTP 404$/);
-  assert.deepEqual(all.errors, [...all.errors].sort(), 'sorted');
-  assert.deepEqual(all.leagues, (await via()).leagues);
-  // answers arriving in reverse order (concurrency 4): the same games and quotes
+  assert.equal(detailKickoff({ ...NEW.list.nfl[0], closed: true }, now, REACH), null);
+  assert.equal(detailKickoff(NEW.list.nfl[0], Date.parse(NEW.list.nfl[0].startTime), REACH), null, 'started: no detail');
+  assert.equal(detailKickoff(NEW.list.nfl.find((e) => !(e.marketCounts.numSpreadsAndTotalsMarkets > 0)), now, REACH), null, 'no lines counted: no detail');
+  // the merge does not depend on which answer came first: answers arriving in reverse order (concurrency 4)
   const slow = await via({ delay: (s) => 40 - 2 * PLANNED.indexOf(s) }, { concurrency: 4 });
-  assert.deepEqual(slow.leagues, (await via()).leagues);
-  // planDetails: the leagues take turns, each by kickoff then id, up to the cap
-  const w = (league, id, kickoff) => ({ league, id, kickoff });
-  const wanted = { nfl: [w('nfl', 'b', 3), w('nfl', 'a', 3), w('nfl', 'c', 1)], cfb: [w('cfb', 'x', 2), w('cfb', 'y', 1), w('cfb', 'z', 5), w('cfb', 'q', 9)] };
-  assert.deepEqual(planDetails(wanted, ['nfl', 'cfb'], 6).map((d) => d.id), ['c', 'y', 'a', 'x', 'b', 'z']);
-  assert.deepEqual(planDetails(wanted, ['nfl', 'cfb'], 0), []);
-  assert.deepEqual(planDetails({ cfb: wanted.cfb }, ['nfl', 'cfb']).map((d) => d.id), ['y', 'x', 'z', 'q'], 'a league without games');
+  assert.deepEqual(slow.leagues, r.leagues);
 });
 
-test('fetchPolyUSInputs: a failed detail keeps the winner; a 403 stops the rest; no details at all is reported by the format check', async () => {
+test('fetchPolyUSInputs: a failed detail keeps the winner; a 403 stops the rest; a cap of 0 reads winner quotes only', async () => {
   // a 404 (an event gone between the list and the detail): that game keeps its winner quote, the rest are read
   const a = await via({ status: { 'nfl-car-phi-2026-10-18': 404 } });
   assert.deepEqual(a.errors, ['nfl nfl-car-phi-2026-10-18: gateway.polymarket.us/v1/events/slug/nfl-car-phi-2026-10-18: HTTP 404']);
   assert.deepEqual(Object.keys(a.leagues.nfl.find((g) => g.id === 'nfl-car-phi-2026-10-18').quotes), ['ml:home']);
-  assert.deepEqual(a.details.nfl, { wanted: 14, pulled: 7 });
+  assert.deepEqual(a.details.nfl, { wanted: 8, pulled: 7, read: 7 });
   // a 5xx is retried once
   let n = 0;
   const flaky = gateway();
-  const b = await fetchPolyUSInputs({ fetchImpl: async (url) => (url.includes('nfl-hou-jax') && !n++ ? new Response('{}', { status: 502 }) : flaky(url)), now: Date.parse(NOW), retryDelayMs: 0, maxDetails: 16 });
+  const b = await fetchPolyUSInputs({ fetchImpl: async (url) => (url.includes('nfl-hou-jax') && !n++ ? new Response('{}', { status: 502 }) : flaky(url)), now: Date.parse(NOW), retryDelayMs: 0, aheadMs: REACH });
   assert.deepEqual([b.requests, b.errors, b.details.nfl.pulled], [21, [], 8]);
-  // a 403 (a block): no further detail GET; one error says so
+  // a 403 (a block) on the first detail: no further detail GET; one error says so
   const calls = [];
-  const c = await via({ calls, status: { 'nfl-hou-jax-2026-10-18': 403 } }, { concurrency: 1 });
+  const c = await via({ calls, status: { 'cfb-clmb-penn-2026-10-16': 403 } }, { concurrency: 1 });
   assert.deepEqual([c.requests, calls.length], [5, 5]);
-  assert.deepEqual(c.errors, ['details stopped after nfl nfl-hou-jax-2026-10-18: gateway.polymarket.us/v1/events/slug/nfl-hou-jax-2026-10-18: HTTP 403']);
+  assert.deepEqual(c.errors, ['details stopped after cfb cfb-clmb-penn-2026-10-16: gateway.polymarket.us/v1/events/slug/cfb-clmb-penn-2026-10-16: HTTP 403']);
   assert.deepEqual([kinds(c.leagues.nfl).sp, kinds(c.leagues.cfb).sp], [0, 0]);
   // a detail that is not an event, or whose winner market is gone: an error, the winner from the list stays
   const d = await via({ details: NEW.details.map((x) => (x.slug === 'nfl-bal-cle-2026-10-18' ? { ...x, markets: x.markets.filter((m) => m.sportsMarketType !== WINNER) } : x)) });
   assert.deepEqual(d.errors, ['nfl nfl-bal-cle-2026-10-18: event detail could not be read (format change?)']);
   assert.deepEqual(Object.keys(d.leagues.nfl.find((g) => g.id === 'nfl-bal-cle-2026-10-18').quotes), ['ml:home']);
-  const e = await fetchPolyUSInputs({ fetchImpl: async (url) => (url.includes('/v1/') ? new Response('{"events":[]}', { status: 200 }) : gateway()(url)), now: Date.parse(NOW), retryDelayMs: 0, maxDetails: 2 });
-  assert.deepEqual(e.errors, ['cfb cfb-clmb-penn-2026-10-16: expected an event with markets (format change?)', 'nfl nfl-hou-jax-2026-10-18: expected an event with markets (format change?)']);
-  // --polyus-details 0: the list only (4 GETs); the spread and total check reports the lines missing
+  const e = await fetchPolyUSInputs({ fetchImpl: async (url) => (url.includes('/v1/') ? new Response('{"events":[]}', { status: 200 }) : gateway()(url)), now: Date.parse(NOW), retryDelayMs: 0, aheadMs: REACH, maxDetails: 2 });
+  assert.deepEqual(e.errors, ['cfb cfb-clmb-penn-2026-10-16: expected an event with markets (format change?)', 'cfb cfb-mphs-tulane-2026-10-16: expected an event with markets (format change?)']);
+  // --polyus-details 0: the list only (4 GETs), winner quotes only; no game's lines were read, so the spread and
+  // total check has nothing to look at
   const z = await via({}, { maxDetails: 0 });
-  assert.deepEqual([z.requests, z.errors, z.details], [4, [], { nfl: { wanted: 14, pulled: 0 }, cfb: { wanted: 68, pulled: 0 } }]);
-  assert.equal(venueFormatErrors('polyus', z).length, 4);
+  assert.deepEqual([z.requests, z.errors, z.details], [4, [], { nfl: { wanted: 8, pulled: 0, read: 0 }, cfb: { wanted: 8, pulled: 0, read: 0 } }]);
+  assert.deepEqual([kinds(z.leagues.nfl).sp, kinds(z.leagues.cfb).tot], [0, 0]);
+  assert.deepEqual(venueFormatErrors('polyus', z), []);
+  assert.deepEqual(venueFormatErrors('polyus', { ...z, details: undefined }).length, 4, 'without the read counts (an older saved pull): checked on every game, as before');
 });
 
 test('format check on the detail format: lines that vanish from the details too set sources.polyus.ok false; the rest still votes', async () => {
@@ -286,4 +288,160 @@ test('orientation regression (detail format): every tight Polymarket US / Kalshi
     assert.ok(swapped[lg].big.length >= 50, `${lg} swapped: ${swapped[lg].big.length}`);
     assert.ok(flipped[lg].big.length >= 50, `${lg} sign flipped: ${flipped[lg].big.length}`);
   }
+});
+
+// ---------------------------------------------------------------- polite: the cap, the 48 hour window, the cadence
+
+test('cap: at most 40 details per pull by default (--polyus-details overrides), nearest kickoff first across both leagues', async () => {
+  const now = Date.parse(NOW);
+  const logs = [];
+  const calls = [];
+  // the lists as served and the defaults: 56 college games want a detail (no NFL game kicks off within 48 hours of
+  // Friday 07:05Z), the 40 nearest are asked for; the 32 the fixture lacks answer 404 and keep their winner quote
+  const r = await fetchPolyUSInputs({ fetchImpl: gateway({ calls, served: true }), now, retryDelayMs: 0, log: (s) => logs.push(s) });
+  const want = servedWanted(now);
+  assert.deepEqual([POLYUS_MAX_DETAILS, want.length], [40, 56]);
+  assert.equal(r.requests, 44);
+  assert.equal(new Set(calls).size, 44, 'one GET each');
+  assert.deepEqual(calls.slice(4), want.slice(0, 40).map((x) => `${POLYUS_BASE}/v1/events/slug/${x.slug}`), 'the 40 nearest, in kickoff order');
+  assert.ok(want[39].t <= want[40].t, 'none left out kicks off before one asked for');
+  assert.deepEqual(r.details, { nfl: { wanted: 0, pulled: 0, read: 0 }, cfb: { wanted: 56, pulled: 8, read: 8 } });
+  assert.equal(r.errors.length, 32);
+  assert.match(r.errors[0], /^cfb cfb-[a-z0-9-]+: gateway\.polymarket\.us\/v1\/events\/slug\/cfb-[a-z0-9-]+: HTTP 404$/);
+  assert.deepEqual(r.errors, [...r.errors].sort(), 'sorted');
+  assert.match(logs.join('\n'), /^polyus: 44 requests \(4 list, 40 event details for 56 games, 16 over the cap of 40\), [\d.]+ MB; /m);
+  // the cap is the maxDetails option (the CLI's --polyus-details): 2 asks for the 2 nearest, 0 for none
+  const two = [];
+  const r2 = await fetchPolyUSInputs({ fetchImpl: gateway({ calls: two, served: true }), now, retryDelayMs: 0, maxDetails: 2 });
+  assert.deepEqual([r2.requests, two.slice(4)], [6, want.slice(0, 2).map((x) => `${POLYUS_BASE}/v1/events/slug/${x.slug}`)]);
+  const r0 = await fetchPolyUSInputs({ fetchImpl: gateway({ served: true }), now, retryDelayMs: 0, maxDetails: 0 });
+  assert.deepEqual([r0.requests, r0.details], [4, { nfl: { wanted: 0, pulled: 0, read: 0 }, cfb: { wanted: 56, pulled: 0, read: 0 } }]);
+  // planDetails: one queue, nearest kickoff first, a tie by league order then id, up to the cap; no league takes turns
+  const w = (league, id, kickoff) => ({ league, id, kickoff });
+  const wanted = { nfl: [w('nfl', 'b', 3), w('nfl', 'a', 3), w('nfl', 'c', 1)], cfb: [w('cfb', 'x', 2), w('cfb', 'y', 1), w('cfb', 'z', 5), w('cfb', 'q', 9)] };
+  assert.deepEqual(planDetails(wanted, ['nfl', 'cfb'], 6).map((d) => d.id), ['c', 'y', 'x', 'a', 'b', 'z']);
+  assert.deepEqual(planDetails(wanted, ['cfb', 'nfl'], 2).map((d) => d.id), ['y', 'c'], 'a tie goes by league order');
+  assert.deepEqual(planDetails(wanted, ['nfl', 'cfb'], 0), []);
+  assert.deepEqual(planDetails({ nfl: [w('nfl', 'm', 10), w('nfl', 'n', 11)], cfb: [w('cfb', 'u', 1), w('cfb', 'v', 2), w('cfb', 'x', 3)] }, ['nfl', 'cfb'], 3).map((d) => d.id), ['u', 'v', 'x'], 'nearer games of one league fill the cap');
+  assert.deepEqual(planDetails({ cfb: wanted.cfb }, ['nfl', 'cfb']).map((d) => d.id), ['y', 'x', 'z', 'q'], 'a league without games');
+  assert.equal(planDetails({ cfb: Array.from({ length: 50 }, (_, i) => w('cfb', `g${String(i).padStart(2, '0')}`, i)) }).length, 40, 'the default cap');
+});
+
+test('48 hour window: details only for games kicking off within 48 hours of the pull; later games keep the list winner quote', async () => {
+  assert.equal(POLYUS_DETAIL_AHEAD_MS, 48 * HOUR);
+  const now = Date.parse(NOW);
+  // the edges, on one college game with lines: after the pull and at most 48 hours later
+  const e = NEW.list.cfb.find((x) => x.marketCounts.numSpreadsAndTotalsMarkets > 0);
+  const at = (ms) => ({ ...e, startTime: iso(ms) });
+  assert.equal(detailKickoff(at(now + 48 * HOUR), now), now + 48 * HOUR, 'exactly 48 hours out: wanted');
+  assert.equal(detailKickoff(at(now + 48 * HOUR + 1000), now), null, 'a second later: not');
+  assert.equal(detailKickoff(at(now + 60e3), now), now + 60e3);
+  assert.equal(detailKickoff(at(now), now), null, 'kicking off now: not');
+  // the lists as served at Friday 07:05Z: the Sunday NFL games are 54 hours or more away, so only college games are
+  // asked for, and the NFL games keep the winner quote from the list
+  const r = await fetchPolyUSInputs({ fetchImpl: gateway({ served: true }), now, retryDelayMs: 0, maxDetails: 100 });
+  assert.deepEqual(r.details, { nfl: { wanted: 0, pulled: 0, read: 0 }, cfb: { wanted: 56, pulled: 8, read: 8 } });
+  assert.equal(r.requests, 4 + 56, 'with a cap of 100, every game within 48 hours and none further out');
+  assert.ok(r.leagues.nfl.every((g) => Object.keys(g.quotes).every((k) => k === 'ml:home')), 'NFL: winner quotes only');
+  const firstNfl = Math.min(...NEW.list.nfl.map((x) => Date.parse(x.startTime)).filter((t) => t > now));
+  assert.equal((firstNfl - now) / HOUR > 48, true);
+  const kicks = (lg) => NEW.list[lg].filter((x) => detailKickoff(x, now) != null).map((x) => Date.parse(x.startTime));
+  assert.ok(kicks('cfb').every((t) => t > now && t <= now + 48 * HOUR));
+  assert.equal(NEW.list.cfb.filter((x) => x.marketCounts.numSpreadsAndTotalsMarkets > 0 && Date.parse(x.startTime) > now + 48 * HOUR).length, 12, 'next week\'s 12 college games with lines wait');
+  // Saturday 14:00Z, the same lists: the Sunday and Monday NFL games are now inside 48 hours, but the 40 nearest are
+  // still Saturday's college games, so the NFL games wait until enough of those have kicked off
+  const sat = Date.parse('2026-10-17T14:00:00Z');
+  const wantSat = (lg) => NEW.list[lg].filter((x) => detailKickoff(x, sat) != null).map((x) => ({ league: lg, id: x.slug, kickoff: Date.parse(x.startTime) }));
+  const plan = planDetails({ nfl: wantSat('nfl'), cfb: wantSat('cfb') });
+  assert.deepEqual([wantSat('nfl').length, wantSat('cfb').length, plan.length, plan.filter((d) => d.league === 'nfl').length], [12, 52, 40, 0]);
+  assert.deepEqual(plan.map((d) => d.id), servedWanted(sat).slice(0, 40).map((x) => x.slug));
+});
+
+test('cadence: at most one pull per 15 minutes from the state dir; runs in between reuse it with the pull\'s fetchedAt; a failed pull is reused too', async () => {
+  assert.equal(POLYUS_MIN_INTERVAL_MS, 15 * 60e3);
+  const tmp = mkdtempSync(join(tmpdir(), 'gd-pu-'));
+  try {
+    const calls = [];
+    const logs = [];
+    let blocked = false;
+    const gw = gateway({ calls });
+    const fetchImpl = async (url) => (blocked ? (calls.push(url), new Response('{"code":7,"message":"x"}', { status: 403 })) : gw(url));
+    const t0 = Date.parse(NOW);
+    const run = (min) => fetchPolyUSInputs({ fetchImpl, now: t0 + min * 60e3, stateDir: tmp, retryDelayMs: 0, aheadMs: REACH, log: (s) => logs.push(s) });
+    const a = await run(0);
+    assert.deepEqual([a.cached, a.requests, a.attemptAt, a.fetchedAt, calls.length, a.errors], [false, 20, NOW, NOW, 20, []]);
+    assert.ok(existsSync(join(tmp, 'polyus.json')), 'state/polyus.json keeps the pull');
+    // 5, 10 and 14 minutes later (and a second short of 15): no request, the same games and quotes, fetchedAt unchanged
+    for (const min of [5, 10, 14, 15 - 1 / 60]) {
+      const b = await run(min);
+      assert.equal(calls.length, 20, `no request ${min} minutes after the pull`);
+      assert.deepEqual([b.cached, b.requests, b.attemptAt, b.fetchedAt], [true, 0, NOW, NOW]);
+      assert.deepEqual([b.leagues, b.seen, b.details, b.errors], [a.leagues, a.seen, a.details, a.errors]);
+    }
+    assert.ok(logs.includes('polyus: reusing the pull from 2026-10-16T07:05:26Z (next pull after 2026-10-16T07:20:26Z)'), logs.join('\n'));
+    // the reused copy builds the same snapshot games as the pull (only sources.polyus.cached and requests differ)
+    const espn = () => ({ fetchedAt: iso(t0 + 14 * 60e3), errors: [], scoreboards: clone(NEW.espn.scoreboards) });
+    const sa = buildSnapshot({ espn: espn(), venues: { polyus: a } }, { now: iso(t0 + 14 * 60e3) });
+    const sb = buildSnapshot({ espn: espn(), venues: { polyus: await run(14) } }, { now: iso(t0 + 14 * 60e3) });
+    assert.deepEqual(sb.games, sa.games);
+    assert.ok(sb.games.some((g) => g.refs?.venues?.polyus?.fetchedAt === NOW), 'refs carry the time of the pull');
+    assert.deepEqual([sb.sources.polyus.cached, sb.sources.polyus.requests, sb.sources.polyus.fetchedAt], [true, 0, NOW]);
+    // 15 minutes after the pull: pulled again, fetchedAt is this run's clock
+    const c = await run(15);
+    assert.deepEqual([c.cached, c.requests, c.fetchedAt, calls.length], [false, 20, '2026-10-16T07:20:26Z', 40]);
+    // a blocked gateway at 30 minutes: one pull (2 list GETs, a 403 is not retried), then reused until 45
+    blocked = true;
+    const d = await run(30);
+    assert.deepEqual([d.cached, d.requests, d.leagues, calls.length], [false, 2, { nfl: null, cfb: null }, 42]);
+    assert.match(d.errors[0], /HTTP 403/);
+    blocked = false;
+    const e = await run(40);
+    assert.deepEqual([e.cached, e.requests, e.leagues, e.fetchedAt, calls.length], [true, 0, { nfl: null, cfb: null }, '2026-10-16T07:35:26Z', 42]);
+    const f = await run(45);
+    assert.deepEqual([f.cached, f.requests, calls.length], [false, 20, 62]);
+    assert.deepEqual(f.leagues, a.leagues);
+    // without a state dir every call pulls (the old behaviour, for tests and one off runs)
+    const n = calls.length;
+    await fetchPolyUSInputs({ fetchImpl, now: t0, retryDelayMs: 0, aheadMs: REACH });
+    await fetchPolyUSInputs({ fetchImpl, now: t0 + 60e3, retryDelayMs: 0, aheadMs: REACH });
+    assert.equal(calls.length, n + 40);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('format check with the 48 hour window: a league with no game that soon is no format change; renamed lines and a missing count still are', async () => {
+  const now = Date.parse(NOW);
+  const served = (opts = {}, g = {}) => fetchPolyUSInputs({ fetchImpl: gateway({ served: true, ...g }), now: opts.now ?? now, retryDelayMs: 0, ...opts });
+  // Friday 07:05Z: no NFL game within 48 hours, so the 28 NFL games carry winner quotes only; that is not an error
+  // (the old check said "nfl: 28 polyus games but no spread quotes (format change?)" here)
+  const r = await served();
+  assert.deepEqual([kinds(r.leagues.nfl).sp, kinds(r.leagues.nfl).tot, kinds(r.leagues.cfb).sp > 0], [0, 0, true]);
+  assert.deepEqual(venueFormatErrors('polyus', r), []);
+  const s = buildSnapshot({ espn: { fetchedAt: NOW, errors: [], scoreboards: clone(NEW.espn.scoreboards) }, venues: { polyus: { ...r, errors: [] } } }, { now: NOW });
+  assert.deepEqual([s.sources.polyus.ok, s.sources.polyus.errors], [true, []], 'the 404s of the details the fixture lacks left out');
+  // Saturday 14:00Z: Sunday's NFL games are within 48 hours but Saturday's college games fill the cap; still no error
+  const sat = await served({ now: Date.parse('2026-10-17T14:00:00Z') });
+  assert.deepEqual([sat.details.nfl.wanted, sat.details.nfl.pulled], [12, 0]);
+  assert.deepEqual(venueFormatErrors('polyus', sat), []);
+  // the spread type renamed in the details: the league whose details were read reports it
+  const renamed = NEW.details.map((d) => ({ ...d, markets: d.markets.map((m) => (m.sportsMarketType === SPREAD ? { ...m, sportsMarketType: 'football_team_full_game_handicap' } : m)) }));
+  const x = await served({}, { details: renamed });
+  assert.deepEqual(venueFormatErrors('polyus', x), ['cfb: 218 polyus games but no spread quotes (format change?)']);
+  // the lines count gone from the list: no detail could ever be asked for, so the fetcher says so
+  // (listsOnly: the list pages from these lists, every detail 404)
+  const listsOnly = (lists) => async (url) => {
+    const u = new URL(url), [, v, leagues, lg] = u.pathname.split('/'), off = Number(u.searchParams.get('offset'));
+    return v === 'v2' && leagues === 'leagues' && lists[lg] ? new Response(JSON.stringify({ events: lists[lg].slice(off, off + 100) }), { status: 200 }) : new Response('{}', { status: 404 });
+  };
+  const noCount = { nfl: NEW.list.nfl.map(({ marketCounts, ...e }) => e), cfb: NEW.list.cfb.map(({ marketCounts, ...e }) => e) };
+  const y = await fetchPolyUSInputs({ fetchImpl: listsOnly(noCount), now, retryDelayMs: 0 });
+  assert.deepEqual([y.requests, y.details.nfl.wanted, y.details.cfb.wanted], [4, 0, 0]);
+  assert.deepEqual(y.errors, [
+    `nfl: ${y.leagues.nfl.length} polyus games but none has a spreads and totals count, so no detail is asked for (format change?)`,
+    `cfb: ${y.leagues.cfb.length} polyus games but none has a spreads and totals count, so no detail is asked for (format change?)`,
+  ]);
+  // the old list format (lines inside the list) has no count and needs none
+  const old = await fetchPolyUSInputs({ fetchImpl: listsOnly({ nfl: OLD.nfl, cfb: OLD.cfb }), now: Date.parse(OLD.fetchedAt), retryDelayMs: 0 });
+  assert.deepEqual([old.requests, old.errors, old.details.nfl.wanted, old.details.nfl.read > 5], [4, [], 0, true]);
 });
