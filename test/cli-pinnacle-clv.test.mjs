@@ -80,7 +80,9 @@ test('collect.mjs --settle: kickoff closes ride with the settle results; plain t
       { ticker: 'KXNFLGAME-26OCT18CARPHI-CAR', kickoff: '2026-10-18T17:00:00Z' },   // not kicked off yet: no lookup
       'KXNFLGAME-26OCT11SFSEA-SEA',
     ];
-    const r = await run(['--settle', '--state-dir', join(tmp, 'state'), '--now', '2026-10-12T04:00:00Z'], { INGEST_URL: site.url, INGEST_KEY: KEY });
+    // Own closes dir: the repo's closes/ archive grows every game day, and a DK close found there adds
+    // "1 with a DK close ref" to the settle line, so the test must not read it.
+    const r = await run(['--settle', '--state-dir', join(tmp, 'state'), '--closes-dir', join(tmp, 'closes'), '--now', '2026-10-12T04:00:00Z'], { INGEST_URL: site.url, INGEST_KEY: KEY });
     assert.equal(r.code, 0, r.out);
     assert.match(r.out, /settle: 3 pending, 3 found on Kalshi, 3 settled \(1 with a close, 0 without\), 0 held for their close; closes: 1 due, 1 looked up \(1 computed/);
     const by = Object.fromEntries(site.state.settled[0].results.map((x) => [x.ticker, x]));
