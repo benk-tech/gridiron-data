@@ -44,7 +44,9 @@ function fakePinnacle({ status = {}, hang = false } = {}) {
     const st = status[`${lg}/${part}`];
     if (typeof st === 'function') return st();
     if (st) return new Response('{"error":"x"}', { status: st });
-    if (hang) return new Promise((_, rej) => init.signal?.addEventListener('abort', () => rej(init.signal.reason), { once: true }));
+    // A ref'd timer keeps the event loop alive while the request hangs: the budget timer is unref'd by design, and
+    // Node 22 on Linux otherwise ends the test before the budget fires ('Promise resolution is still pending').
+    if (hang) return new Promise((_, rej) => { const keep = setInterval(() => {}, 1000); init.signal?.addEventListener('abort', () => { clearInterval(keep); rej(init.signal.reason); }, { once: true }); });
     return new Response(JSON.stringify(RAW[lg][part].body), { status: 200, headers: { 'last-modified': RAW[lg][part].lastModified } });
   };
   f.calls = calls;

@@ -374,7 +374,8 @@ function fakeGitHub(files) {
     const x = files[url];
     if (!x) return new Response('', { status: 404 });
     if (x.status) return new Response('', { status: x.status });
-    if (x.stall) return new Promise((_, rej) => init.signal?.addEventListener('abort', () => rej(init.signal.reason)));
+    // Ref'd keep-alive while stalled (the budget timer is unref'd; Node 22 on Linux would end the test early).
+    if (x.stall) return new Promise((_, rej) => { const keep = setInterval(() => {}, 1000); init.signal?.addEventListener('abort', () => { clearInterval(keep); rej(init.signal.reason); }, { once: true }); });
     const headers = { etag: x.etag, 'last-modified': 'Tue, 13 Oct 2026 10:05:49 GMT' };
     return method === 'HEAD' ? new Response(null, { status: 200, headers }) : new Response(x.body, { status: 200, headers });
   };
